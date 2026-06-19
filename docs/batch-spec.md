@@ -1,5 +1,8 @@
 # Batch Spec
 
+Batch mode is planned and documented here for design alignment. It is not
+implemented in the current `game-asset` binary.
+
 Batch mode lets users run repeatable multi-asset jobs without turning the CLI
 into a project manager.
 
@@ -162,4 +165,3 @@ With `--json`, each task event includes the batch task ID:
 {"type":"artifact","id":"menu_bgm","path":"dist/audio/bgm/menu.mp3","kind":"audio"}
 {"type":"task_done","id":"menu_bgm","elapsed_ms":21044}
 ```
-

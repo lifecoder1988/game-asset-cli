@@ -40,19 +40,25 @@ Temporary files are implementation details. They must be placed under the OS tem
 directory or next to the target output with a unique suffix, and removed or
 atomically renamed before the command exits.
 
-## Global Options
+## Shared IO Options
 
-Every command follows the same IO policy:
+Commands use the same IO policy where the option applies:
 
 ```text
---out <path>          required for single-file generators
---out-dir <path>      required for multi-file generators
---overwrite           replace existing output
---dry-run             validate inputs and print planned provider calls
---json                emit JSONL events to stdout
---metadata-out <path> write explicit JSON metadata
---quiet               suppress non-error human logs
+--out <path>             required for single-file generators
+--out-dir <path>         required for multi-file generators
+--overwrite              replace existing output
+--dry-run                validate inputs and print planned provider calls
+--json                   emit JSONL events to stdout
+--json-include-prompts   include prompt text in JSONL provider_request events
+--metadata-out <path>    write explicit JSON metadata
+--quiet                  suppress non-error human logs
 ```
+
+`--dry-run` applies to the provider-backed generators (`image generate`,
+`image green-source`, `audio bgm`); pure local transforms run to completion.
+`--metadata-out` is accepted where a meaningful sidecar exists (the generators
+and `sprite sheet-pack`). `--json` and `--quiet` are global.
 
 Default overwrite behavior is fail-closed: if an output path exists and
 `--overwrite` is not set, the command exits without modifying it.
@@ -155,7 +161,7 @@ dependency error when `ffmpeg` is missing.
 game-asset audio bgm \
   --prompt prompts/menu_bgm.md \
   --instrumental \
-  --model music-2.6 \
+  --model music-2.6-free \
   --format mp3 \
   --sample-rate 44100 \
   --bitrate 256000 \
@@ -193,12 +199,24 @@ Rules:
 
 ### Audio Post-processing
 
+Implemented:
+
 ```bash
 game-asset audio trim --in raw.wav --start 0.1 --end 1.8 --out trimmed.wav
+game-asset audio waveform --in bgm.wav --out audit/bgm_waveform.png
+```
+
+`trim` and `waveform` operate on PCM WAV input (8/16/24/32-bit integer and
+32-bit float are supported); `trim` preserves the input sample format. Compressed
+inputs (mp3, ogg) are not decoded and fail with a clear error — convert to WAV
+first.
+
+Planned, not implemented in the current binary:
+
+```bash
 game-asset audio normalize --in raw.wav --target-lufs -16 --out normalized.wav
 game-asset audio loop --in bgm.mp3 --crossfade-ms 1200 --out bgm_loop.wav
 game-asset audio convert --in bgm.wav --format ogg --out bgm.ogg
-game-asset audio waveform --in bgm.wav --out audit/bgm_waveform.png
 game-asset audio sprite --in-dir audio/sfx --out audio/sfx_sprite.ogg --metadata-out audio/sfx_sprite.json
 ```
 
@@ -214,6 +232,8 @@ game-asset doctor
 state.
 
 ### Batch
+
+Planned, not implemented in the current binary:
 
 ```bash
 game-asset batch --spec assets.yaml --parallel 4
@@ -240,10 +260,18 @@ With `--json`, commands emit machine-readable events:
 
 ```json
 {"type":"start","command":"audio.bgm","out":"audio/bgm/menu.mp3"}
-{"type":"provider_request","provider":"minimax-music","model":"music-2.6"}
+{"type":"provider_request","provider":"minimax-music","model":"music-2.6-free"}
 {"type":"artifact","path":"audio/bgm/menu.mp3","kind":"audio","bytes":813651}
 {"type":"done","elapsed_ms":18420}
 ```
 
-No event is required to include secrets or full prompt text. Prompt text should be
+Every command emits a `start` event first and a `done` event last. On failure in
+`--json` mode the command emits a single `error` event to stdout instead of a
+human log line, then exits with the matching code:
+
+```json
+{"type":"error","code":3,"message":"input file missing or invalid"}
+```
+
+No event is required to include secrets or full prompt text. Prompt text is
 included only with `--json-include-prompts`.
