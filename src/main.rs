@@ -9,10 +9,14 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Mutex,
     time::Instant,
 };
 use tempfile::TempDir;
-use tokio::{process::Command as TokioCommand, time::Duration};
+use tokio::{
+    process::Command as TokioCommand,
+    time::{sleep, Duration},
+};
 
 #[derive(Parser)]
 #[command(name = "game-asset")]
@@ -474,6 +478,7 @@ async fn run(cli: Cli, started: Instant) -> Result<()> {
         json: cli.json,
         quiet: cli.quiet,
         include_prompts: cli.json_include_prompts,
+        pending_start: Mutex::new(None),
     };
     let (command_name, out) = command_label(&cli.command);
     let mut start_event = serde_json::Map::new();
@@ -515,6 +520,12 @@ struct Ctx {
     json: bool,
     quiet: bool,
     include_prompts: bool,
+    // The `start` event is buffered here and only flushed once the first real
+    // event (provider_request/artifact/warning/done) is emitted. A command that
+    // fails during validation never produces a real event, so on the error path
+    // the start is dropped and only a single `error` object reaches stdout,
+    // satisfying the documented JSON contract.
+    pending_start: Mutex<Option<Value>>,
 }
 
 fn command_label(command: &Commands) -> (String, Option<String>) {
@@ -556,6 +567,17 @@ fn command_label(command: &Commands) -> (String, Option<String>) {
 
 impl Ctx {
     fn event(&self, typ: &str, value: Value) {
+        if typ == "start" {
+            *self.pending_start.lock().unwrap() = Some(value);
+            return;
+        }
+        if let Some(start) = self.pending_start.lock().unwrap().take() {
+            self.emit("start", start);
+        }
+        self.emit(typ, value);
+    }
+
+    fn emit(&self, typ: &str, value: Value) {
         if self.json {
             let mut obj = serde_json::Map::new();
             obj.insert("type".into(), Value::String(typ.into()));
@@ -686,12 +708,23 @@ fn image_chroma_key(ctx: &Ctx, args: ChromaKeyArgs) -> Result<()> {
         image::open(&args.input).map_err(|e| CliError::new(3, format!("decode image: {e}")))?;
     let mut rgba = img.to_rgba8();
     let spill = args.despill.clamp(0.0, 1.0);
+    let feather = args.feather.max(0.0);
     for pixel in rgba.pixels_mut() {
         let d = color_distance(pixel.0, key);
-        if d <= args.tolerance {
+        // Alpha coverage: 0 inside the key tolerance, ramping up to 1 across the
+        // feather band just outside it (hard edge when --feather is 0).
+        let coverage = if d <= args.tolerance {
+            0.0
+        } else if feather > 0.0 {
+            ((d - args.tolerance) / feather).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        if coverage <= 0.0 {
             pixel.0[3] = 0;
         } else {
             apply_despill(&mut pixel.0, key, d, args.tolerance, spill);
+            pixel.0[3] = (pixel.0[3] as f32 * coverage).round() as u8;
         }
     }
     let out = if args.trim {
@@ -735,7 +768,8 @@ fn sprite_sheet_slice(ctx: &Ctx, args: SheetSliceArgs) -> Result<()> {
             format!("output directory exists: {}", args.out_dir.display()),
         ));
     }
-    fs::create_dir_all(&args.out_dir)?;
+    // Decode and validate the grid BEFORE touching the filesystem so an invalid
+    // grid (e.g. larger than the image) doesn't leave a stray empty out-dir.
     let img = image::open(&args.input)
         .map_err(|e| CliError::new(3, format!("decode image: {e}")))?
         .to_rgba8();
@@ -744,6 +778,21 @@ fn sprite_sheet_slice(ctx: &Ctx, args: SheetSliceArgs) -> Result<()> {
     if cell_w == 0 || cell_h == 0 {
         return Err(CliError::new(2, "grid is larger than image"));
     }
+    if img.width() % cols != 0 || img.height() % rows != 0 {
+        ctx.event(
+            "warning",
+            json!({
+                "message": format!(
+                    "{}x{} image does not divide evenly by a {cols}x{rows} grid; {}px column / {}px row remainder is dropped",
+                    img.width(), img.height(), img.width() % cols, img.height() % rows
+                )
+            }),
+        );
+    }
+    fs::create_dir_all(&args.out_dir)?;
+    // `--overwrite` is a clean replacement: clear stale frames from a prior slice
+    // so a later sheet-pack can't pick up orphaned frames.
+    clear_frame_pngs(&args.out_dir)?;
     let mut index = 0;
     for r in 0..rows {
         for c in 0..cols {
@@ -821,6 +870,12 @@ fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
     if args.frames == 0 || args.frames > 64 {
         return Err(CliError::new(2, "--frames must be between 1 and 64"));
     }
+    if !args.input.is_file() {
+        return Err(CliError::new(
+            3,
+            format!("input not found: {}", args.input.display()),
+        ));
+    }
     if which::which("ffmpeg").is_err() {
         return Err(CliError::new(5, "ffmpeg not found in PATH"));
     }
@@ -831,10 +886,17 @@ fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
         ));
     }
     fs::create_dir_all(&args.out_dir)?;
+    // `--overwrite` means a clean replacement: drop any frame_*.png from a prior
+    // run so stale frames can't be reported as new artifacts or packed downstream.
+    clear_frame_pngs(&args.out_dir)?;
     let frames = args.frames;
     let duration = args.end - args.start;
     let fps = frames as f32 / duration;
     let pattern = args.out_dir.join("frame_%03d.png");
+    // Note: deliberately no `-t {duration}`. The `fps` filter emits a boundary
+    // frame at t=duration which `-t` would truncate, causing an off-by-one
+    // shortfall (e.g. 64 requested -> 63 produced). `-frames:v` alone caps the
+    // count exactly while letting that final frame through.
     let status = Command::new("ffmpeg")
         .arg("-y")
         .arg("-nostdin")
@@ -844,8 +906,6 @@ fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
         .arg(args.start.to_string())
         .arg("-i")
         .arg(&args.input)
-        .arg("-t")
-        .arg(duration.to_string())
         .arg("-vf")
         .arg(format!("fps={fps:.4}"))
         .arg("-frames:v")
@@ -855,6 +915,29 @@ fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
         .map_err(|e| CliError::new(6, format!("run ffmpeg: {e}")))?;
     if !status.success() {
         return Err(CliError::new(6, "ffmpeg failed"));
+    }
+    // ffmpeg exits 0 even when seeking past EOF or given a still image, producing
+    // zero frames. Treat "no frames" as a hard error, and a partial count (e.g.
+    // --end beyond the clip duration) as a warning rather than a silent success.
+    let produced = sorted_pngs(&args.out_dir)?.len() as u32;
+    if produced == 0 {
+        return Err(CliError::new(
+            6,
+            "no frames produced: --start may be past the end of the video, or the input has no decodable video stream",
+        ));
+    }
+    if produced < frames {
+        ctx.event(
+            "warning",
+            json!({
+                "message": format!(
+                    "requested {frames} frames but only {produced} were produced; the [{}, {}]s range likely exceeds the video duration",
+                    args.start, args.end
+                ),
+                "requested": frames,
+                "produced": produced
+            }),
+        );
     }
     if let Some(key) = args.key.as_deref().filter(|k| *k != "auto") {
         let key = parse_hex_color(key)?;
@@ -974,6 +1057,7 @@ async fn audio_bgm(ctx: &Ctx, args: AudioBgmArgs) -> Result<()> {
 fn audio_sfx(ctx: &Ctx, args: AudioSfxArgs) -> Result<()> {
     validate_positive_u32("--duration-ms", args.duration_ms)?;
     validate_positive_u32("--sample-rate", args.sample_rate)?;
+    validate_positive_u32("--variations", args.variations)?;
     if let Some(pitch) = args.pitch {
         validate_positive_f32("--pitch", pitch)?;
     }
@@ -1386,24 +1470,70 @@ Output handling (follow exactly):\n\
         request_event["prompt"] = Value::String(instruction.to_string());
     }
     ctx.event("provider_request", request_event);
-    let output = tokio::time::timeout(
-        Duration::from_secs(timeout_seconds),
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output(),
-    )
-    .await
-    .map_err(|_| CliError::new(6, format!("codex-image timed out after {timeout_seconds}s")))?
-    .map_err(|e| CliError::new(6, format!("run codex: {e}")))?;
-    if !output.status.success() {
-        return Err(CliError::new(
-            6,
-            format!(
-                "codex failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-                    .lines()
-                    .last()
-                    .unwrap_or("no stderr")
-            ),
-        ));
+
+    // Drive codex by polling for the output file instead of blocking on full
+    // process exit. Codex writes asset.png, then runs a view_image confirmation
+    // step that can extend the process lifetime well past the timeout. Waiting on
+    // exit means a perfectly good (already-written) image gets killed and thrown
+    // away. Instead: as soon as asset.png is on disk with a stable size, stop
+    // codex and use what it produced.
+    //
+    // stdout is sent to /dev/null (codex streams verbose agent logs there; if we
+    // piped it without draining, the pipe buffer would fill and deadlock codex
+    // before it ever wrote the image). stderr is piped and drained concurrently
+    // so the last line is still available for error reporting.
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| CliError::new(6, format!("run codex: {e}")))?;
+    let stderr_tail = std::sync::Arc::new(Mutex::new(String::new()));
+    if let Some(mut err) = child.stderr.take() {
+        let sink = stderr_tail.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf).await;
+            *sink.lock().unwrap() = buf;
+        });
+    }
+    let asset = tmpdir.path().join(rel_out);
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let mut last_size: Option<u64> = None;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| CliError::new(6, format!("wait codex: {e}")))?
+        {
+            // Codex exited on its own. A nonzero status is only fatal if no image
+            // was written — codex may exit nonzero after a successful write.
+            if !status.success() && !asset.is_file() && sorted_pngs(tmpdir.path())?.is_empty() {
+                let tail = stderr_tail.lock().unwrap().clone();
+                let tail = tail.lines().last().unwrap_or("no stderr").to_string();
+                return Err(CliError::new(6, format!("codex failed: {tail}")));
+            }
+            break;
+        }
+        // asset.png present and size steady across two consecutive polls => the
+        // write has completed; terminate codex early.
+        match fs::metadata(&asset).map(|m| m.len()) {
+            Ok(size) if size > 0 && last_size == Some(size) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                break;
+            }
+            Ok(size) if size > 0 => last_size = Some(size),
+            _ => last_size = None,
+        }
+        if Instant::now() >= deadline {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(CliError::new(
+                6,
+                format!("codex-image timed out after {timeout_seconds}s"),
+            ));
+        }
+        sleep(Duration::from_millis(400)).await;
     }
     // Prefer the agreed asset.png; otherwise accept the single PNG the agent left
     // in the fresh temp working dir (any .png there was created by this run).
@@ -1460,8 +1590,7 @@ Output handling (follow exactly):\n\
                 "provider": "codex-image",
                 "timeout_seconds": timeout_seconds,
                 "sandbox": sandbox,
-                "stdout": String::from_utf8_lossy(&output.stdout),
-                "stderr": String::from_utf8_lossy(&output.stderr),
+                "stderr": stderr_tail.lock().unwrap().clone(),
             }),
             true,
         )?;
@@ -1521,8 +1650,18 @@ fn render_sfx_file(
             .map_err(|e| CliError::new(1, format!("create wav: {e}")))?;
         let n = ((duration_ms as f32 / 1000.0) * sample_rate as f32) as usize;
         let mut rng = XorShift64(seed ^ 0x9e3779b97f4a7c15);
+        // Tonal presets (coin/jump/laser/...) are pure functions of time and never
+        // touch `rng`, so without this every `--variations` file would be identical.
+        // Derive a small deterministic detune from the seed and scale the time base
+        // by it; seed 0 maps to exactly 1.0 so the canonical sound is unchanged.
+        let detune = if seed == 0 {
+            1.0
+        } else {
+            let mut jr = XorShift64(seed.wrapping_mul(0xD1B54A32D192ED03) ^ 0x94D049BB133111EB);
+            1.0 + (jr.next_f32() - 0.5) * 0.06
+        };
         for i in 0..n {
-            let t = i as f32 / sample_rate as f32;
+            let t = (i as f32 / sample_rate as f32) * detune;
             let u = i as f32 / n.max(1) as f32;
             let sample = match preset {
                 SfxPreset::Coin => {
@@ -1827,8 +1966,11 @@ fn apply_despill(pixel: &mut [u8; 4], key: [u8; 3], distance: f32, tolerance: f3
     if spill <= 0.0 {
         return;
     }
-    // Spill band: from the keying edge out to 2x tolerance (min 32px radius).
-    let band = (tolerance * 2.0).max(tolerance + 32.0);
+    // Spill band: from the keying edge outward, scaled by tolerance. Anchoring
+    // the band to tolerance (rather than a fixed 32px floor) means tolerance=0
+    // keys nothing AND despills nothing, so solid key-color pixels the user
+    // chose to keep are left untouched instead of being silently desaturated.
+    let band = tolerance * 2.0;
     if distance > band {
         return;
     }
@@ -2003,6 +2145,22 @@ fn sorted_pngs(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Remove `frame_*.png` files this tool generated in a prior run so `--overwrite`
+/// is a clean replacement. Only touches files matching our own naming scheme.
+fn clear_frame_pngs(dir: &Path) -> Result<()> {
+    for file in sorted_pngs(dir)? {
+        let is_frame = file
+            .file_name()
+            .and_then(OsStr::to_str)
+            .map(|n| n.starts_with("frame_"))
+            .unwrap_or(false);
+        if is_frame {
+            fs::remove_file(&file)?;
+        }
+    }
+    Ok(())
+}
+
 fn image_kind_name(kind: &ImageKind) -> &'static str {
     match kind {
         ImageKind::Scene => "scene",
@@ -2098,6 +2256,7 @@ mod tests {
                 json: false,
                 quiet: true,
                 include_prompts: false,
+                pending_start: Mutex::new(None),
             },
             ContactSheetArgs {
                 inputs: vec![input.display().to_string()],
@@ -2119,6 +2278,7 @@ mod tests {
                 json: false,
                 quiet: true,
                 include_prompts: false,
+                pending_start: Mutex::new(None),
             },
             AudioSfxArgs {
                 preset: SfxPreset::Coin,
@@ -2147,6 +2307,7 @@ mod tests {
                 json: false,
                 quiet: true,
                 include_prompts: false,
+                pending_start: Mutex::new(None),
             },
             AudioWaveformArgs {
                 input,
@@ -2216,6 +2377,7 @@ mod tests {
                     json: false,
                     quiet: true,
                     include_prompts: false,
+                    pending_start: Mutex::new(None),
                 },
                 AudioTrimArgs {
                     input: path,
@@ -2244,6 +2406,7 @@ mod tests {
                 json: false,
                 quiet: true,
                 include_prompts: false,
+                pending_start: Mutex::new(None),
             },
             ManifestArgs {
                 input,
