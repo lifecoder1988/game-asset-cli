@@ -36,6 +36,14 @@ game-asset audio waveform --in coin.wav --out coin_waveform.png
 game-asset audio trim --in raw.wav --start 0.1 --end 1.8 --out trimmed.wav
 ```
 
+`audio trim` and `audio waveform` accept PCM WAV input (8/16/24/32-bit integer or
+32-bit float); `trim` preserves the input sample format. Compressed inputs such as
+mp3 are not decoded and fail with a clear error — convert to WAV first.
+
+With `--json`, every command emits a leading `start` event and a trailing `done`
+event; failures emit a single `{"type":"error",...}` event to stdout. Add
+`--json-include-prompts` to include prompt text in `provider_request` events.
+
 Audit and metadata:
 
 ```bash
@@ -58,6 +66,9 @@ Image generation wraps the local Codex CLI:
 
 - `CODEX_BIN` optionally points to the Codex executable.
 - `CODEX_SANDBOX` defaults to `workspace-write`.
+- `--timeout-seconds` controls the Codex subprocess timeout for image commands.
+- `doctor` checks the Codex binary and `codex exec` availability, but does not
+  run a model/image generation probe by default.
 
 Background music uses the MiniMax music API:
 
@@ -69,4 +80,3 @@ Short SFX are generated locally and deterministically.
 
 See [docs/](docs/) for the product spec, technical design, provider design, and
 roadmap.
-

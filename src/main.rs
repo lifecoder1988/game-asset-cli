@@ -12,6 +12,7 @@ use std::{
     time::Instant,
 };
 use tempfile::TempDir;
+use tokio::{process::Command as TokioCommand, time::Duration};
 
 #[derive(Parser)]
 #[command(name = "game-asset")]
@@ -22,18 +23,27 @@ struct Cli {
     json: bool,
     #[arg(long, global = true)]
     quiet: bool,
+    #[arg(long = "json-include-prompts", global = true)]
+    json_include_prompts: bool,
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(about = "Generate and transform raster images")]
     Image(ImageCmd),
+    #[command(about = "Normalize, slice, and pack sprite assets")]
     Sprite(SpriteCmd),
+    #[command(about = "Extract frame sequences from video")]
     Video(VideoCmd),
+    #[command(about = "Generate and process audio assets")]
     Audio(AudioCmd),
+    #[command(about = "Create an image contact sheet from input globs")]
     ContactSheet(ContactSheetArgs),
+    #[command(about = "Write a JSON manifest for an asset directory")]
     Manifest(ManifestArgs),
+    #[command(about = "Check local provider dependencies and credentials")]
     Doctor,
 }
 
@@ -45,11 +55,15 @@ struct ImageCmd {
 
 #[derive(Subcommand)]
 enum ImageSubcommand {
+    #[command(about = "Generate one image through the Codex image provider")]
     Generate(ImageGenerateArgs),
+    #[command(about = "Crop a rectangle from an image")]
     Crop(CropArgs),
     #[command(name = "green-source")]
+    #[command(about = "Generate one asset on a chroma-key background")]
     GreenSource(GreenSourceArgs),
     #[command(name = "chroma-key")]
+    #[command(about = "Remove a chroma-key background from an image")]
     ChromaKey(ChromaKeyArgs),
 }
 
@@ -75,6 +89,8 @@ struct ImageGenerateArgs {
     metadata_out: Option<PathBuf>,
     #[arg(long = "codex-model")]
     codex_model: Option<String>,
+    #[arg(long = "timeout-seconds", default_value_t = 300)]
+    timeout_seconds: u64,
     #[arg(long)]
     dry_run: bool,
 }
@@ -99,6 +115,8 @@ struct GreenSourceArgs {
     metadata_out: Option<PathBuf>,
     #[arg(long = "codex-model")]
     codex_model: Option<String>,
+    #[arg(long = "timeout-seconds", default_value_t = 300)]
+    timeout_seconds: u64,
     #[arg(long)]
     dry_run: bool,
 }
@@ -144,9 +162,12 @@ struct SpriteCmd {
 #[derive(Subcommand)]
 enum SpriteSubcommand {
     #[command(name = "sheet-slice")]
+    #[command(about = "Slice a sprite sheet into frame PNGs")]
     SheetSlice(SheetSliceArgs),
     #[command(name = "sheet-pack")]
+    #[command(about = "Pack frame PNGs into a sprite sheet")]
     SheetPack(SheetPackArgs),
+    #[command(about = "Resize and anchor a sprite onto a fixed canvas")]
     Normalize(SpriteNormalizeArgs),
 }
 
@@ -202,6 +223,7 @@ struct VideoCmd {
 
 #[derive(Subcommand)]
 enum VideoSubcommand {
+    #[command(about = "Extract evenly sampled PNG frames from a video")]
     Slice(VideoSliceArgs),
 }
 
@@ -231,9 +253,13 @@ struct AudioCmd {
 
 #[derive(Subcommand)]
 enum AudioSubcommand {
+    #[command(about = "Generate background music with MiniMax")]
     Bgm(AudioBgmArgs),
+    #[command(about = "Generate deterministic local sound effects")]
     Sfx(AudioSfxArgs),
+    #[command(about = "Trim a WAV file by time range")]
     Trim(AudioTrimArgs),
+    #[command(about = "Render a waveform PNG from a WAV file")]
     Waveform(AudioWaveformArgs),
 }
 
@@ -424,11 +450,19 @@ impl From<io::Error> for CliError {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let json = cli.json;
     let started = Instant::now();
     let code = match run(cli, started).await {
         Ok(()) => 0,
         Err(err) => {
-            eprintln!("error: {}", err.message);
+            if json {
+                println!(
+                    "{}",
+                    json!({"type": "error", "code": err.code, "message": err.message})
+                );
+            } else {
+                eprintln!("error: {}", err.message);
+            }
             err.code
         }
     };
@@ -439,7 +473,15 @@ async fn run(cli: Cli, started: Instant) -> Result<()> {
     let ctx = Ctx {
         json: cli.json,
         quiet: cli.quiet,
+        include_prompts: cli.json_include_prompts,
     };
+    let (command_name, out) = command_label(&cli.command);
+    let mut start_event = serde_json::Map::new();
+    start_event.insert("command".into(), Value::String(command_name));
+    if let Some(out) = out {
+        start_event.insert("out".into(), Value::String(out));
+    }
+    ctx.event("start", Value::Object(start_event));
     match cli.command {
         Commands::Image(cmd) => match cmd.command {
             ImageSubcommand::Generate(args) => image_generate(&ctx, args).await?,
@@ -472,6 +514,44 @@ async fn run(cli: Cli, started: Instant) -> Result<()> {
 struct Ctx {
     json: bool,
     quiet: bool,
+    include_prompts: bool,
+}
+
+fn command_label(command: &Commands) -> (String, Option<String>) {
+    let display = |p: &Path| p.display().to_string();
+    match command {
+        Commands::Image(cmd) => match &cmd.command {
+            ImageSubcommand::Generate(a) => ("image.generate".into(), Some(display(&a.out))),
+            ImageSubcommand::Crop(a) => ("image.crop".into(), Some(display(&a.out))),
+            ImageSubcommand::GreenSource(a) => ("image.green-source".into(), Some(display(&a.out))),
+            ImageSubcommand::ChromaKey(a) => ("image.chroma-key".into(), Some(display(&a.out))),
+        },
+        Commands::Sprite(cmd) => match &cmd.command {
+            SpriteSubcommand::SheetSlice(a) => {
+                ("sprite.sheet-slice".into(), Some(display(&a.out_dir)))
+            }
+            SpriteSubcommand::SheetPack(a) => ("sprite.sheet-pack".into(), Some(display(&a.out))),
+            SpriteSubcommand::Normalize(a) => ("sprite.normalize".into(), Some(display(&a.out))),
+        },
+        Commands::Video(cmd) => match &cmd.command {
+            VideoSubcommand::Slice(a) => ("video.slice".into(), Some(display(&a.out_dir))),
+        },
+        Commands::Audio(cmd) => match &cmd.command {
+            AudioSubcommand::Bgm(a) => ("audio.bgm".into(), Some(display(&a.out))),
+            AudioSubcommand::Sfx(a) => (
+                "audio.sfx".into(),
+                a.out
+                    .as_deref()
+                    .or(a.out_dir.as_deref())
+                    .map(display),
+            ),
+            AudioSubcommand::Trim(a) => ("audio.trim".into(), Some(display(&a.out))),
+            AudioSubcommand::Waveform(a) => ("audio.waveform".into(), Some(display(&a.out))),
+        },
+        Commands::ContactSheet(a) => ("contact-sheet".into(), Some(display(&a.out))),
+        Commands::Manifest(a) => ("manifest".into(), Some(display(&a.out))),
+        Commands::Doctor => ("doctor".into(), None),
+    }
 }
 
 impl Ctx {
@@ -485,16 +565,44 @@ impl Ctx {
                 }
             }
             println!("{}", Value::Object(obj));
-        } else if !self.quiet && typ == "artifact" {
-            if let Some(path) = value.get("path").and_then(Value::as_str) {
-                eprintln!("wrote {path}");
+        } else if !self.quiet {
+            match typ {
+                "artifact" => {
+                    if let Some(path) = value.get("path").and_then(Value::as_str) {
+                        eprintln!("wrote {path}");
+                    }
+                }
+                "provider_request" => {
+                    if let Some(provider) = value.get("provider").and_then(Value::as_str) {
+                        if value
+                            .get("dry_run")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            eprintln!("planned provider request: {provider}");
+                        } else if let Some(timeout) =
+                            value.get("timeout_seconds").and_then(Value::as_u64)
+                        {
+                            eprintln!("running {provider} (timeout {timeout}s)");
+                        } else {
+                            eprintln!("running {provider}");
+                        }
+                    }
+                }
+                "warning" => {
+                    if let Some(message) = value.get("message").and_then(Value::as_str) {
+                        eprintln!("warning: {message}");
+                    }
+                }
+                _ => {}
             }
         }
     }
 }
 
 async fn image_generate(ctx: &Ctx, args: ImageGenerateArgs) -> Result<()> {
-    ensure_output(&args.out, args.overwrite)?;
+    check_output_available(&args.out, args.overwrite)?;
+    validate_timeout(args.timeout_seconds)?;
     let prompt = read_prompt(args.prompt.as_deref(), args.prompt_text.as_deref())?;
     let style = read_optional(args.style.as_deref())?;
     let size = args.size.as_deref().map(parse_size).transpose()?;
@@ -514,13 +622,18 @@ async fn image_generate(ctx: &Ctx, args: ImageGenerateArgs) -> Result<()> {
         args.overwrite,
         args.metadata_out.as_deref(),
         args.codex_model.as_deref(),
+        size,
+        None,
+        args.timeout_seconds,
         args.dry_run,
     )
     .await
 }
 
 async fn image_green_source(ctx: &Ctx, args: GreenSourceArgs) -> Result<()> {
-    ensure_output(&args.out, args.overwrite)?;
+    check_output_available(&args.out, args.overwrite)?;
+    validate_timeout(args.timeout_seconds)?;
+    let key = parse_hex_color(&args.key_color)?;
     let prompt = read_prompt(args.prompt.as_deref(), args.prompt_text.as_deref())?;
     let instruction = image_instruction(
         green_kind_name(&args.kind),
@@ -538,6 +651,9 @@ async fn image_green_source(ctx: &Ctx, args: GreenSourceArgs) -> Result<()> {
         args.overwrite,
         args.metadata_out.as_deref(),
         args.codex_model.as_deref(),
+        None,
+        Some(key),
+        args.timeout_seconds,
         args.dry_run,
     )
     .await
@@ -548,7 +664,13 @@ fn image_crop(ctx: &Ctx, args: CropArgs) -> Result<()> {
     let (x, y, w, h) = parse_box(&args.box_)?;
     let img =
         image::open(&args.input).map_err(|e| CliError::new(3, format!("decode image: {e}")))?;
-    if x + w > img.width() || y + h > img.height() {
+    let max_x = x
+        .checked_add(w)
+        .ok_or_else(|| CliError::new(2, "crop box exceeds image bounds"))?;
+    let max_y = y
+        .checked_add(h)
+        .ok_or_else(|| CliError::new(2, "crop box exceeds image bounds"))?;
+    if max_x > img.width() || max_y > img.height() {
         return Err(CliError::new(2, "crop box exceeds image bounds"));
     }
     let cropped = img.crop_imm(x, y, w, h);
@@ -563,17 +685,13 @@ fn image_chroma_key(ctx: &Ctx, args: ChromaKeyArgs) -> Result<()> {
     let img =
         image::open(&args.input).map_err(|e| CliError::new(3, format!("decode image: {e}")))?;
     let mut rgba = img.to_rgba8();
+    let spill = args.despill.clamp(0.0, 1.0);
     for pixel in rgba.pixels_mut() {
         let d = color_distance(pixel.0, key);
         if d <= args.tolerance {
             pixel.0[3] = 0;
         } else {
-            let spill = args.despill.clamp(0.0, 1.0);
-            let g = pixel.0[1] as f32;
-            let max_rb = pixel.0[0].max(pixel.0[2]) as f32;
-            if g > max_rb {
-                pixel.0[1] = ((g - (g - max_rb) * spill).clamp(0.0, 255.0)) as u8;
-            }
+            apply_despill(&mut pixel.0, key, d, args.tolerance, spill);
         }
     }
     let out = if args.trim {
@@ -641,6 +759,7 @@ fn sprite_sheet_slice(ctx: &Ctx, args: SheetSliceArgs) -> Result<()> {
 
 fn sprite_sheet_pack(ctx: &Ctx, args: SheetPackArgs) -> Result<()> {
     ensure_output(&args.out, args.overwrite)?;
+    validate_positive_u32("--cols", args.cols)?;
     let mut files: Vec<PathBuf> = fs::read_dir(&args.input_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| kind_from_ext(p) == "image")
@@ -654,7 +773,7 @@ fn sprite_sheet_pack(ctx: &Ctx, args: SheetPackArgs) -> Result<()> {
         .to_rgba8();
     let frame_w = first.width();
     let frame_h = first.height();
-    let cols = args.cols.max(1);
+    let cols = args.cols;
     let rows = (files.len() as u32 + cols - 1) / cols;
     let mut sheet = RgbaImage::from_pixel(cols * frame_w, rows * frame_h, Rgba([0, 0, 0, 0]));
     let mut frames = Vec::new();
@@ -694,11 +813,16 @@ fn sprite_sheet_pack(ctx: &Ctx, args: SheetPackArgs) -> Result<()> {
 }
 
 fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
-    if which::which("ffmpeg").is_err() {
-        return Err(CliError::new(5, "ffmpeg not found in PATH"));
-    }
+    validate_nonnegative_f32("--start", args.start)?;
+    validate_nonnegative_f32("--end", args.end)?;
     if args.end <= args.start {
         return Err(CliError::new(2, "--end must be greater than --start"));
+    }
+    if args.frames == 0 || args.frames > 64 {
+        return Err(CliError::new(2, "--frames must be between 1 and 64"));
+    }
+    if which::which("ffmpeg").is_err() {
+        return Err(CliError::new(5, "ffmpeg not found in PATH"));
     }
     if args.out_dir.exists() && !args.overwrite {
         return Err(CliError::new(
@@ -707,12 +831,15 @@ fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
         ));
     }
     fs::create_dir_all(&args.out_dir)?;
-    let frames = args.frames.clamp(1, 64);
+    let frames = args.frames;
     let duration = args.end - args.start;
     let fps = frames as f32 / duration;
     let pattern = args.out_dir.join("frame_%03d.png");
     let status = Command::new("ffmpeg")
         .arg("-y")
+        .arg("-nostdin")
+        .arg("-loglevel")
+        .arg("error")
         .arg("-ss")
         .arg(args.start.to_string())
         .arg("-i")
@@ -750,7 +877,9 @@ fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
 }
 
 async fn audio_bgm(ctx: &Ctx, args: AudioBgmArgs) -> Result<()> {
-    ensure_output(&args.out, args.overwrite)?;
+    check_output_available(&args.out, args.overwrite)?;
+    validate_positive_u32("--sample-rate", args.sample_rate)?;
+    validate_positive_u32("--bitrate", args.bitrate)?;
     let prompt = read_prompt(args.prompt.as_deref(), args.prompt_text.as_deref())?;
     let lyrics = read_prompt(args.lyrics.as_deref(), args.lyrics_text.as_deref()).ok();
     if !args.instrumental && lyrics.is_none() && !args.lyrics_optimizer {
@@ -759,19 +888,22 @@ async fn audio_bgm(ctx: &Ctx, args: AudioBgmArgs) -> Result<()> {
             "vocals require --lyrics/--lyrics-text or --lyrics-optimizer",
         ));
     }
+    warn_format_extension(ctx, &args.out, &args.format);
     if args.dry_run {
-        ctx.event(
-            "provider_request",
-            json!({"provider": "minimax-music", "model": args.model, "dry_run": true}),
-        );
+        let mut event = json!({"provider": "minimax-music", "model": args.model, "dry_run": true});
+        if ctx.include_prompts {
+            event["prompt"] = Value::String(prompt.clone());
+        }
+        ctx.event("provider_request", event);
         return Ok(());
     }
     let key =
         env::var("MINIMAX_API_KEY").map_err(|_| CliError::new(5, "MINIMAX_API_KEY is not set"))?;
-    ctx.event(
-        "provider_request",
-        json!({"provider": "minimax-music", "model": args.model}),
-    );
+    let mut request_event = json!({"provider": "minimax-music", "model": args.model});
+    if ctx.include_prompts {
+        request_event["prompt"] = Value::String(prompt.clone());
+    }
+    ctx.event("provider_request", request_event);
     let req = json!({
         "model": args.model,
         "prompt": prompt,
@@ -816,7 +948,21 @@ async fn audio_bgm(ctx: &Ctx, args: AudioBgmArgs) -> Result<()> {
         hex::decode(audio_hex).map_err(|e| CliError::new(6, format!("decode hex audio: {e}")))?;
     write_atomic(&args.out, &bytes, args.overwrite)?;
     if let Some(path) = args.metadata_out {
-        write_json_atomic(&path, &body, true)?;
+        // Don't duplicate the entire (hex-encoded) audio payload into the sidecar.
+        let mut meta = body.clone();
+        if let Some(audio) = meta.pointer_mut("/data/audio") {
+            *audio = Value::String(format!("<{} bytes omitted>", bytes.len()));
+        }
+        let summary = json!({
+            "provider": "minimax-music",
+            "model": args.model,
+            "format": args.format,
+            "sample_rate": args.sample_rate,
+            "bitrate": args.bitrate,
+            "audio_bytes": bytes.len(),
+            "response": meta,
+        });
+        write_json_atomic(&path, &summary, true)?;
     }
     ctx.event(
         "artifact",
@@ -826,6 +972,11 @@ async fn audio_bgm(ctx: &Ctx, args: AudioBgmArgs) -> Result<()> {
 }
 
 fn audio_sfx(ctx: &Ctx, args: AudioSfxArgs) -> Result<()> {
+    validate_positive_u32("--duration-ms", args.duration_ms)?;
+    validate_positive_u32("--sample-rate", args.sample_rate)?;
+    if let Some(pitch) = args.pitch {
+        validate_positive_f32("--pitch", pitch)?;
+    }
     if args.variations <= 1 {
         let out = args
             .out
@@ -865,48 +1016,74 @@ fn audio_sfx(ctx: &Ctx, args: AudioSfxArgs) -> Result<()> {
 }
 
 fn audio_trim(ctx: &Ctx, args: AudioTrimArgs) -> Result<()> {
-    ensure_output(&args.out, args.overwrite)?;
+    validate_nonnegative_f32("--start", args.start)?;
+    validate_nonnegative_f32("--end", args.end)?;
     if args.end <= args.start {
         return Err(CliError::new(2, "--end must be greater than --start"));
     }
+    ensure_output(&args.out, args.overwrite)?;
+    require_wav_extension(&args.input)?;
     let mut reader = hound::WavReader::open(&args.input)
         .map_err(|e| CliError::new(3, format!("open wav: {e}")))?;
     let spec = reader.spec();
     let channels = spec.channels as usize;
     let start = (args.start * spec.sample_rate as f32) as usize * channels;
     let end = (args.end * spec.sample_rate as f32) as usize * channels;
-    let samples: Vec<i16> = reader
-        .samples::<i16>()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| CliError::new(3, format!("read wav samples: {e}")))?;
-    let start = start.min(samples.len());
-    let end = end.min(samples.len());
     let tmp = temp_path_for(&args.out);
-    {
+    let result: Result<()> = (|| {
         let mut writer = hound::WavWriter::create(&tmp, spec)
             .map_err(|e| CliError::new(1, format!("create wav: {e}")))?;
-        for s in &samples[start..end] {
-            writer
-                .write_sample(*s)
-                .map_err(|e| CliError::new(1, e.to_string()))?;
+        // Read with a sample type that matches the file's format/bit depth so
+        // 8/16/24/32-bit PCM and 32-bit float all round-trip without loss.
+        match spec.sample_format {
+            hound::SampleFormat::Int => {
+                let samples: Vec<i32> = reader
+                    .samples::<i32>()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| CliError::new(3, format!("read wav samples: {e}")))?;
+                let (start, end) = (start.min(samples.len()), end.min(samples.len()));
+                for s in &samples[start..end] {
+                    writer
+                        .write_sample(*s)
+                        .map_err(|e| CliError::new(1, e.to_string()))?;
+                }
+            }
+            hound::SampleFormat::Float => {
+                let samples: Vec<f32> = reader
+                    .samples::<f32>()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| CliError::new(3, format!("read wav samples: {e}")))?;
+                let (start, end) = (start.min(samples.len()), end.min(samples.len()));
+                for s in &samples[start..end] {
+                    writer
+                        .write_sample(*s)
+                        .map_err(|e| CliError::new(1, e.to_string()))?;
+                }
+            }
         }
         writer
             .finalize()
             .map_err(|e| CliError::new(1, e.to_string()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, &args.out)?;
+    result?;
+    fs::rename(&tmp, &args.out).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        CliError::from(e)
+    })?;
     ctx.event("artifact", json!({"path": args.out, "kind": "audio"}));
     Ok(())
 }
 
 fn audio_waveform(ctx: &Ctx, args: AudioWaveformArgs) -> Result<()> {
+    validate_positive_u32("--width", args.width)?;
+    validate_positive_u32("--height", args.height)?;
     ensure_output(&args.out, args.overwrite)?;
-    let mut reader = hound::WavReader::open(&args.input)
-        .map_err(|e| CliError::new(3, format!("open wav: {e}")))?;
-    let samples: Vec<i16> = reader
-        .samples::<i16>()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| CliError::new(3, format!("read wav samples: {e}")))?;
+    require_wav_extension(&args.input)?;
+    let samples = read_wav_normalized(&args.input)?;
     let mut img = RgbaImage::from_pixel(args.width, args.height, Rgba([12, 14, 18, 255]));
     if !samples.is_empty() {
         for x in 0..args.width {
@@ -914,10 +1091,7 @@ fn audio_waveform(ctx: &Ctx, args: AudioWaveformArgs) -> Result<()> {
             let b = (((x + 1) as usize * samples.len()) / args.width as usize)
                 .max(a + 1)
                 .min(samples.len());
-            let peak = samples[a..b]
-                .iter()
-                .map(|s| (*s as f32).abs() / i16::MAX as f32)
-                .fold(0.0, f32::max);
+            let peak = samples[a..b].iter().map(|s| s.abs()).fold(0.0, f32::max);
             let half = (peak * args.height as f32 * 0.46) as i32;
             let mid = args.height as i32 / 2;
             for y in (mid - half).max(0)..=(mid + half).min(args.height as i32 - 1) {
@@ -931,6 +1105,10 @@ fn audio_waveform(ctx: &Ctx, args: AudioWaveformArgs) -> Result<()> {
 }
 
 fn contact_sheet(ctx: &Ctx, args: ContactSheetArgs) -> Result<()> {
+    validate_positive_u32("--cols", args.cols)?;
+    if args.cell <= 12 {
+        return Err(CliError::new(2, "--cell must be greater than 12"));
+    }
     ensure_output(&args.out, args.overwrite)?;
     let mut files = Vec::new();
     for pattern in &args.inputs {
@@ -942,7 +1120,7 @@ fn contact_sheet(ctx: &Ctx, args: ContactSheetArgs) -> Result<()> {
     if files.is_empty() {
         return Err(CliError::new(3, "no input images matched"));
     }
-    let cols = args.cols.max(1);
+    let cols = args.cols;
     let rows = ((files.len() as u32) + cols - 1) / cols;
     let mut sheet =
         RgbaImage::from_pixel(cols * args.cell, rows * args.cell, Rgba([24, 26, 30, 255]));
@@ -986,6 +1164,13 @@ fn manifest(ctx: &Ctx, args: ManifestArgs) -> Result<()> {
         let path = entry.path();
         let bytes = fs::read(path)?;
         let rel = path.strip_prefix(&args.input).unwrap_or(path);
+        // When --in points at a single file, strip_prefix yields an empty path;
+        // fall back to the file name so the entry is still identifiable.
+        let rel = if rel.as_os_str().is_empty() {
+            Path::new(path.file_name().unwrap_or(OsStr::new("file")))
+        } else {
+            rel
+        };
         entries.push(ManifestEntry {
             path: rel.to_string_lossy().replace('\\', "/"),
             kind: kind_from_ext(path).to_string(),
@@ -1004,16 +1189,33 @@ fn manifest(ctx: &Ctx, args: ManifestArgs) -> Result<()> {
 }
 
 fn doctor(ctx: &Ctx) -> Result<()> {
-    let codex = which::which(env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into())).ok();
+    let codex_bin = env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
+    let codex = resolve_executable(&codex_bin);
+    let codex_version = codex
+        .as_ref()
+        .and_then(|path| command_first_stdout_line(path, ["--version"]));
+    let codex_exec = codex
+        .as_ref()
+        .map(|path| command_output_contains(path, ["exec", "--help"], "codex exec"))
+        .unwrap_or(false);
     let ffmpeg = which::which("ffmpeg").ok();
     let minimax = env::var("MINIMAX_API_KEY").is_ok();
+    let sandbox = env::var("CODEX_SANDBOX").unwrap_or_else(|_| "workspace-write".into());
+    let sandbox_allowed = matches!(sandbox.as_str(), "workspace-write" | "read-only");
+    let temp_dir_writable = temp_dir_is_writable();
     if ctx.json {
         ctx.event(
             "doctor",
             json!({
                 "codex": codex.as_ref().map(|p| p.display().to_string()),
+                "codex_version": codex_version,
+                "codex_exec": codex_exec,
+                "codex_image_probe": "not_run",
+                "codex_sandbox": sandbox,
+                "codex_sandbox_allowed": sandbox_allowed,
                 "ffmpeg": ffmpeg.as_ref().map(|p| p.display().to_string()),
-                "minimax_api_key": minimax
+                "minimax_api_key": minimax,
+                "temp_dir_writable": temp_dir_writable
             }),
         );
     } else {
@@ -1022,6 +1224,27 @@ fn doctor(ctx: &Ctx) -> Result<()> {
             codex
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "missing".into())
+        );
+        println!(
+            "codex version: {}",
+            codex_version.unwrap_or_else(|| "unknown".into())
+        );
+        println!(
+            "codex exec: {}",
+            if codex_exec {
+                "available"
+            } else {
+                "unavailable"
+            }
+        );
+        println!("codex image probe: not run");
+        println!(
+            "CODEX_SANDBOX: {}",
+            if sandbox_allowed {
+                sandbox
+            } else {
+                format!("{sandbox} (invalid)")
+            }
         );
         println!(
             "ffmpeg: {}",
@@ -1033,8 +1256,54 @@ fn doctor(ctx: &Ctx) -> Result<()> {
             "MINIMAX_API_KEY: {}",
             if minimax { "set" } else { "missing" }
         );
+        println!(
+            "temp dir writable: {}",
+            if temp_dir_writable { "yes" } else { "no" }
+        );
     }
     Ok(())
+}
+
+fn resolve_executable(candidate: &str) -> Option<PathBuf> {
+    let path = Path::new(candidate);
+    if path.components().count() > 1 {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    which::which(candidate).ok()
+}
+
+fn command_output_contains<const N: usize>(path: &Path, args: [&str; N], needle: &str) -> bool {
+    let output = match Command::new(path).args(args).output() {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout).contains(needle)
+        || String::from_utf8_lossy(&output.stderr).contains(needle)
+}
+
+fn command_first_stdout_line<const N: usize>(path: &Path, args: [&str; N]) -> Option<String> {
+    let output = Command::new(path).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .map(str::to_string)
+}
+
+fn temp_dir_is_writable() -> bool {
+    let dir = match TempDir::new() {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+    let path = dir.path().join("game-asset-doctor.tmp");
+    fs::write(&path, b"ok")
+        .and_then(|_| fs::remove_file(path))
+        .is_ok()
 }
 
 async fn run_codex_image(
@@ -1045,12 +1314,12 @@ async fn run_codex_image(
     overwrite: bool,
     metadata_out: Option<&Path>,
     model: Option<&str>,
+    requested_size: Option<(u32, u32)>,
+    green_key: Option<[u8; 3]>,
+    timeout_seconds: u64,
     dry_run: bool,
 ) -> Result<()> {
-    let codex_bin = env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
-    if which::which(&codex_bin).is_err() {
-        return Err(CliError::new(5, format!("{codex_bin} not found in PATH")));
-    }
+    let mut canonical_refs = Vec::new();
     for r in refs {
         if !r.is_file() {
             return Err(CliError::new(
@@ -1058,41 +1327,72 @@ async fn run_codex_image(
                 format!("reference image not found: {}", r.display()),
             ));
         }
+        canonical_refs.push(
+            fs::canonicalize(r).map_err(|e| CliError::new(3, format!("{}: {e}", r.display())))?,
+        );
     }
     if dry_run {
-        ctx.event(
-            "provider_request",
-            json!({"provider": "codex-image", "dry_run": true}),
-        );
+        let mut event = json!({
+            "provider": "codex-image",
+            "dry_run": true,
+            "timeout_seconds": timeout_seconds,
+            "refs": canonical_refs,
+            "requested_size": requested_size.map(|(w, h)| json!({"width": w, "height": h}))
+        });
+        if ctx.include_prompts {
+            event["prompt"] = Value::String(instruction.to_string());
+        }
+        ctx.event("provider_request", event);
         return Ok(());
     }
 
+    let codex_bin = env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
+    let codex_path = resolve_executable(&codex_bin)
+        .ok_or_else(|| CliError::new(5, format!("{codex_bin} not found or not executable")))?;
+    let sandbox = codex_sandbox()?;
     let tmpdir = TempDir::new().map_err(|e| CliError::new(1, e.to_string()))?;
     let rel_out = "asset.png";
     let final_instruction = format!(
-        "{instruction}\n\nUse the native $imagegen tool directly. Write exactly one PNG file to `{rel_out}` in the current working directory. Create parent directories if needed. Do not write any project files, manifests, or extra state."
+        "{instruction}\n\n\
+Output handling (follow exactly):\n\
+- Generate the image with the built-in image_gen tool in THIS session for THIS request.\n\
+- Then materialize the PNG that YOUR image_gen call just produced in this session into `{rel_out}` in the current working directory. The image_gen result is the base64 PNG payload of your own `image_generation_call` in this session's rollout; decode that exact payload to `{rel_out}` (for example with `base64 -D`). Use only the result of the call you just made.\n\
+- Do NOT scan `$CODEX_HOME/generated_images` or any other directory for the newest PNG by modification time. Those locations accumulate unrelated images from previous sessions, so picking the latest file will copy the wrong image.\n\
+- After writing it, open `{rel_out}` with the view_image tool and confirm it matches the requested subject. If it does not match, or if no image was generated in this session, regenerate. Never substitute a pre-existing, stale, or unrelated file.\n\
+- On success, `{rel_out}` must be the ONLY .png in the current working directory and must be the image you just generated. Create parent directories if needed. Do not write any project files, manifests, scripts, or extra state beyond `{rel_out}`.\n\
+- If image generation is unavailable or fails, exit with a non-zero status. Do NOT copy any placeholder or stale image to `{rel_out}`."
     );
-    let mut cmd = Command::new(codex_bin);
+    let mut cmd = TokioCommand::new(codex_path);
+    // NOTE: do not pass --ephemeral. Under --ephemeral codex does not persist the
+    // session rollout, so the agent cannot recover the base64 PNG produced by its
+    // own image_gen call and the run hangs until timeout. A normal (persisted)
+    // session lets the agent decode its result into asset.png.
     cmd.arg("exec")
-        .arg("--ephemeral")
         .arg("--skip-git-repo-check")
         .arg("--sandbox")
-        .arg(env::var("CODEX_SANDBOX").unwrap_or_else(|_| "workspace-write".into()))
+        .arg(&sandbox)
         .arg("-C")
         .arg(tmpdir.path());
+    cmd.kill_on_drop(true);
     if let Some(model) = model {
         cmd.arg("--model").arg(model);
     }
     cmd.arg(final_instruction);
-    for r in refs {
+    for r in &canonical_refs {
         cmd.arg("--image").arg(r);
     }
-    ctx.event("provider_request", json!({"provider": "codex-image"}));
-    let output = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| CliError::new(6, format!("run codex: {e}")))?;
+    let mut request_event = json!({"provider": "codex-image", "timeout_seconds": timeout_seconds});
+    if ctx.include_prompts {
+        request_event["prompt"] = Value::String(instruction.to_string());
+    }
+    ctx.event("provider_request", request_event);
+    let output = tokio::time::timeout(
+        Duration::from_secs(timeout_seconds),
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output(),
+    )
+    .await
+    .map_err(|_| CliError::new(6, format!("codex-image timed out after {timeout_seconds}s")))?
+    .map_err(|e| CliError::new(6, format!("run codex: {e}")))?;
     if !output.status.success() {
         return Err(CliError::new(
             6,
@@ -1105,15 +1405,52 @@ async fn run_codex_image(
             ),
         ));
     }
-    let generated = tmpdir.path().join(rel_out);
-    if !generated.is_file() {
-        return Err(CliError::new(
-            6,
-            "codex completed but did not create asset.png",
-        ));
-    }
-    image::open(&generated)
+    // Prefer the agreed asset.png; otherwise accept the single PNG the agent left
+    // in the fresh temp working dir (any .png there was created by this run).
+    let generated = {
+        let preferred = tmpdir.path().join(rel_out);
+        if preferred.is_file() {
+            preferred
+        } else {
+            let pngs = sorted_pngs(tmpdir.path())?;
+            pngs.into_iter().next_back().ok_or_else(|| {
+                CliError::new(6, "codex completed but did not produce a PNG image")
+            })?
+        }
+    };
+    let generated_img = image::open(&generated)
         .map_err(|e| CliError::new(7, format!("generated file is not an image: {e}")))?;
+    if let Some((expected_w, expected_h)) = requested_size {
+        if generated_img.width() != expected_w || generated_img.height() != expected_h {
+            ctx.event(
+                "warning",
+                json!({
+                    "message": format!(
+                        "provider returned {}x{} but --size requested {}x{}",
+                        generated_img.width(),
+                        generated_img.height(),
+                        expected_w,
+                        expected_h
+                    ),
+                    "expected_width": expected_w,
+                    "expected_height": expected_h,
+                    "actual_width": generated_img.width(),
+                    "actual_height": generated_img.height()
+                }),
+            );
+        }
+    }
+    if let Some(key) = green_key {
+        let rgba = generated_img.to_rgba8();
+        if !green_source_has_key_background(&rgba, key) {
+            ctx.event(
+                "warning",
+                json!({
+                    "message": "generated green-source image does not appear to contain a solid key-color background"
+                }),
+            );
+        }
+    }
     let bytes = fs::read(&generated)?;
     write_atomic(out, &bytes, overwrite)?;
     if let Some(meta) = metadata_out {
@@ -1121,6 +1458,8 @@ async fn run_codex_image(
             meta,
             &json!({
                 "provider": "codex-image",
+                "timeout_seconds": timeout_seconds,
+                "sandbox": sandbox,
                 "stdout": String::from_utf8_lossy(&output.stdout),
                 "stderr": String::from_utf8_lossy(&output.stderr),
             }),
@@ -1171,48 +1510,120 @@ fn render_sfx_file(
     overwrite: bool,
 ) -> Result<()> {
     let tmp = temp_path_for(out);
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(&tmp, spec)
-        .map_err(|e| CliError::new(1, format!("create wav: {e}")))?;
-    let n = ((duration_ms as f32 / 1000.0) * sample_rate as f32) as usize;
-    let mut rng = XorShift64(seed ^ 0x9e3779b97f4a7c15);
-    for i in 0..n {
-        let t = i as f32 / sample_rate as f32;
-        let u = i as f32 / n.max(1) as f32;
-        let sample = match preset {
-            SfxPreset::Coin => {
-                let f = pitch.unwrap_or(if u < 0.45 { 880.0 } else { 1320.0 });
-                sine(f, t) * decay(u, 8.0)
-            }
-            SfxPreset::Click => noise(&mut rng) * decay(u, 40.0) * 0.45,
-            SfxPreset::Confirm => (sine(660.0, t) + 0.6 * sine(990.0, t)) * decay(u, 5.5),
-            SfxPreset::Cancel => sine(240.0 + 120.0 * (1.0 - u), t) * decay(u, 8.0),
-            SfxPreset::Powerup => sine(420.0 + 900.0 * u, t) * (1.0 - u).powf(0.4),
-            SfxPreset::Error => square(180.0, t) * decay(u, 3.5) * 0.35,
-            SfxPreset::Hit => (noise(&mut rng) * 0.45 + sine(90.0, t) * 0.8) * decay(u, 16.0),
-            SfxPreset::Explosion => {
-                (noise(&mut rng) * (1.0 - u) + sine(70.0 - 30.0 * u, t)) * decay(u, 5.0)
-            }
-            SfxPreset::Jump => sine(280.0 + 420.0 * u, t) * decay(u, 3.0),
-            SfxPreset::Laser => saw(1200.0 - 700.0 * u, t) * decay(u, 7.0) * 0.45,
-            SfxPreset::Whoosh => noise(&mut rng) * (1.0 - (2.0 * u - 1.0).abs()) * 0.55,
+    let result: Result<()> = (|| {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
         };
-        let sample = soft_clip(sample * 0.8);
+        let mut writer = hound::WavWriter::create(&tmp, spec)
+            .map_err(|e| CliError::new(1, format!("create wav: {e}")))?;
+        let n = ((duration_ms as f32 / 1000.0) * sample_rate as f32) as usize;
+        let mut rng = XorShift64(seed ^ 0x9e3779b97f4a7c15);
+        for i in 0..n {
+            let t = i as f32 / sample_rate as f32;
+            let u = i as f32 / n.max(1) as f32;
+            let sample = match preset {
+                SfxPreset::Coin => {
+                    let f = pitch.unwrap_or(if u < 0.45 { 880.0 } else { 1320.0 });
+                    sine(f, t) * decay(u, 8.0)
+                }
+                SfxPreset::Click => noise(&mut rng) * decay(u, 40.0) * 0.45,
+                SfxPreset::Confirm => (sine(660.0, t) + 0.6 * sine(990.0, t)) * decay(u, 5.5),
+                SfxPreset::Cancel => sine(240.0 + 120.0 * (1.0 - u), t) * decay(u, 8.0),
+                SfxPreset::Powerup => sine(420.0 + 900.0 * u, t) * (1.0 - u).powf(0.4),
+                SfxPreset::Error => square(180.0, t) * decay(u, 3.5) * 0.35,
+                SfxPreset::Hit => (noise(&mut rng) * 0.45 + sine(90.0, t) * 0.8) * decay(u, 16.0),
+                SfxPreset::Explosion => {
+                    (noise(&mut rng) * (1.0 - u) + sine(70.0 - 30.0 * u, t)) * decay(u, 5.0)
+                }
+                SfxPreset::Jump => sine(280.0 + 420.0 * u, t) * decay(u, 3.0),
+                SfxPreset::Laser => saw(1200.0 - 700.0 * u, t) * decay(u, 7.0) * 0.45,
+                SfxPreset::Whoosh => noise(&mut rng) * (1.0 - (2.0 * u - 1.0).abs()) * 0.55,
+            };
+            let sample = soft_clip(sample * 0.8);
+            writer
+                .write_sample((sample * i16::MAX as f32) as i16)
+                .map_err(|e| CliError::new(1, e.to_string()))?;
+        }
         writer
-            .write_sample((sample * i16::MAX as f32) as i16)
+            .finalize()
             .map_err(|e| CliError::new(1, e.to_string()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    writer
-        .finalize()
-        .map_err(|e| CliError::new(1, e.to_string()))?;
-    write_atomic_from_file(&tmp, out, overwrite)?;
+    result?;
+    let result = write_atomic_from_file(&tmp, out, overwrite);
     let _ = fs::remove_file(tmp);
-    Ok(())
+    result
+}
+
+fn warn_format_extension(ctx: &Ctx, out: &Path, format: &str) {
+    let ext = out
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !ext.is_empty() && ext != format.to_ascii_lowercase() {
+        ctx.event(
+            "warning",
+            json!({
+                "message": format!(
+                    "output extension '.{ext}' does not match --format '{format}'; \
+the file will contain {format}-encoded audio"
+                )
+            }),
+        );
+    }
+}
+
+fn require_wav_extension(path: &Path) -> Result<()> {
+    let ext = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "wav" {
+        return Ok(());
+    }
+    Err(CliError::new(
+        3,
+        format!(
+            "trim/waveform require a PCM WAV input; got '{}'. Convert to WAV first \
+(compressed formats like mp3/ogg are not decoded by this tool).",
+            if ext.is_empty() { "no extension" } else { &ext }
+        ),
+    ))
+}
+
+/// Read any WAV (8/16/24/32-bit PCM or 32-bit float) into samples normalized to
+/// roughly [-1.0, 1.0], so downstream rendering is independent of bit depth.
+fn read_wav_normalized(path: &Path) -> Result<Vec<f32>> {
+    let mut reader =
+        hound::WavReader::open(path).map_err(|e| CliError::new(3, format!("open wav: {e}")))?;
+    let spec = reader.spec();
+    match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CliError::new(3, format!("read wav samples: {e}"))),
+        hound::SampleFormat::Int => {
+            let max = if spec.bits_per_sample >= 32 {
+                i32::MAX as f32
+            } else {
+                ((1i64 << (spec.bits_per_sample - 1)) - 1) as f32
+            };
+            let max = max.max(1.0);
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / max))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| CliError::new(3, format!("read wav samples: {e}")))
+        }
+    }
 }
 
 fn read_prompt(path: Option<&Path>, text: Option<&str>) -> Result<String> {
@@ -1234,24 +1645,78 @@ fn read_optional(path: Option<&Path>) -> Result<Option<String>> {
         .map_err(|e| CliError::new(3, e.to_string()))
 }
 
-fn ensure_output(path: &Path, overwrite: bool) -> Result<()> {
+fn check_output_available(path: &Path, overwrite: bool) -> Result<()> {
     if path.exists() && !overwrite {
         return Err(CliError::new(
             4,
             format!("output exists: {}", path.display()),
         ));
     }
+    Ok(())
+}
+
+fn ensure_output(path: &Path, overwrite: bool) -> Result<()> {
+    check_output_available(path, overwrite)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     Ok(())
 }
 
+fn validate_positive_u32(name: &str, value: u32) -> Result<()> {
+    if value == 0 {
+        return Err(CliError::new(2, format!("{name} must be greater than 0")));
+    }
+    Ok(())
+}
+
+fn validate_positive_f32(name: &str, value: f32) -> Result<()> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(CliError::new(2, format!("{name} must be greater than 0")));
+    }
+    Ok(())
+}
+
+fn validate_nonnegative_f32(name: &str, value: f32) -> Result<()> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(CliError::new(2, format!("{name} must be non-negative")));
+    }
+    Ok(())
+}
+
+fn validate_timeout(seconds: u64) -> Result<()> {
+    if seconds == 0 {
+        return Err(CliError::new(2, "--timeout-seconds must be greater than 0"));
+    }
+    Ok(())
+}
+
+fn codex_sandbox() -> Result<String> {
+    let sandbox = env::var("CODEX_SANDBOX").unwrap_or_else(|_| "workspace-write".into());
+    match sandbox.as_str() {
+        "workspace-write" | "read-only" => Ok(sandbox),
+        "danger-full-access" => Err(CliError::new(
+            2,
+            "CODEX_SANDBOX=danger-full-access is not allowed by game-asset",
+        )),
+        _ => Err(CliError::new(
+            2,
+            "CODEX_SANDBOX must be workspace-write or read-only",
+        )),
+    }
+}
+
 fn write_atomic(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
     ensure_output(path, overwrite)?;
     let tmp = temp_path_for(path);
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
+    fs::write(&tmp, bytes).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        CliError::from(e)
+    })?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        CliError::from(e)
+    })?;
     Ok(())
 }
 
@@ -1269,9 +1734,14 @@ fn write_json_atomic(path: &Path, value: &Value, overwrite: bool) -> Result<()> 
 fn save_image_atomic(path: &Path, img: &DynamicImage, overwrite: bool) -> Result<()> {
     ensure_output(path, overwrite)?;
     let tmp = temp_path_for(path);
-    img.save(&tmp)
-        .map_err(|e| CliError::new(1, format!("save image: {e}")))?;
-    fs::rename(&tmp, path)?;
+    img.save(&tmp).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        CliError::new(1, format!("save image: {e}"))
+    })?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        CliError::from(e)
+    })?;
     Ok(())
 }
 
@@ -1295,10 +1765,11 @@ fn parse_size(s: &str) -> Result<(u32, u32)> {
     let (w, h) = s
         .split_once('x')
         .ok_or_else(|| CliError::new(2, "size must be WIDTHxHEIGHT"))?;
-    Ok((
-        w.parse().map_err(|_| CliError::new(2, "invalid width"))?,
-        h.parse().map_err(|_| CliError::new(2, "invalid height"))?,
-    ))
+    let w = w.parse().map_err(|_| CliError::new(2, "invalid width"))?;
+    let h = h.parse().map_err(|_| CliError::new(2, "invalid height"))?;
+    validate_positive_u32("width", w)?;
+    validate_positive_u32("height", h)?;
+    Ok((w, h))
 }
 
 fn parse_box(s: &str) -> Result<(u32, u32, u32, u32)> {
@@ -1306,20 +1777,21 @@ fn parse_box(s: &str) -> Result<(u32, u32, u32, u32)> {
     if parts.len() != 4 {
         return Err(CliError::new(2, "box must be x,y,w,h"));
     }
-    Ok((
-        parts[0]
-            .parse()
-            .map_err(|_| CliError::new(2, "invalid box x"))?,
-        parts[1]
-            .parse()
-            .map_err(|_| CliError::new(2, "invalid box y"))?,
-        parts[2]
-            .parse()
-            .map_err(|_| CliError::new(2, "invalid box w"))?,
-        parts[3]
-            .parse()
-            .map_err(|_| CliError::new(2, "invalid box h"))?,
-    ))
+    let x = parts[0]
+        .parse()
+        .map_err(|_| CliError::new(2, "invalid box x"))?;
+    let y = parts[1]
+        .parse()
+        .map_err(|_| CliError::new(2, "invalid box y"))?;
+    let w = parts[2]
+        .parse()
+        .map_err(|_| CliError::new(2, "invalid box w"))?;
+    let h = parts[3]
+        .parse()
+        .map_err(|_| CliError::new(2, "invalid box h"))?;
+    validate_positive_u32("box w", w)?;
+    validate_positive_u32("box h", h)?;
+    Ok((x, y, w, h))
 }
 
 fn parse_grid(s: &str) -> Result<(u32, u32)> {
@@ -1345,6 +1817,42 @@ fn parse_hex_color(s: &str) -> Result<[u8; 3]> {
     }
     let bytes = hex::decode(h).map_err(|_| CliError::new(2, "invalid hex color"))?;
     Ok([bytes[0], bytes[1], bytes[2]])
+}
+
+/// Reduce key-color spill on a kept pixel, but only when that pixel is plausibly
+/// contaminated by the key — i.e. it sits within a spill band just outside the
+/// keying tolerance. Pixels far from the key hue (legitimate teal/green art) are
+/// left untouched, so despill no longer discolors the whole image.
+fn apply_despill(pixel: &mut [u8; 4], key: [u8; 3], distance: f32, tolerance: f32, spill: f32) {
+    if spill <= 0.0 {
+        return;
+    }
+    // Spill band: from the keying edge out to 2x tolerance (min 32px radius).
+    let band = (tolerance * 2.0).max(tolerance + 32.0);
+    if distance > band {
+        return;
+    }
+    // Identify the key's dominant channel and only suppress that channel.
+    let key_max = key[0].max(key[1]).max(key[2]);
+    if key_max == 0 {
+        return;
+    }
+    let chan = if key[1] == key_max {
+        1
+    } else if key[0] == key_max {
+        0
+    } else {
+        2
+    };
+    let c = pixel[chan] as f32;
+    let other = match chan {
+        1 => pixel[0].max(pixel[2]),
+        0 => pixel[1].max(pixel[2]),
+        _ => pixel[0].max(pixel[1]),
+    } as f32;
+    if c > other {
+        pixel[chan] = (c - (c - other) * spill).clamp(0.0, 255.0) as u8;
+    }
 }
 
 fn color_distance(pixel: [u8; 4], key: [u8; 3]) -> f32 {
@@ -1373,6 +1881,28 @@ fn trim_alpha(img: &RgbaImage) -> Option<RgbaImage> {
         return None;
     }
     Some(imageops::crop_imm(img, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1).to_image())
+}
+
+fn green_source_has_key_background(img: &RgbaImage, key: [u8; 3]) -> bool {
+    if img.width() == 0 || img.height() == 0 {
+        return false;
+    }
+    // Allow for mild provider/compression noise rather than requiring an exact match.
+    const KEY_TOLERANCE: f32 = 24.0;
+    let corners = [
+        img.get_pixel(0, 0).0,
+        img.get_pixel(img.width() - 1, 0).0,
+        img.get_pixel(0, img.height() - 1).0,
+        img.get_pixel(img.width() - 1, img.height() - 1).0,
+    ];
+    if corners.iter().all(|p| color_distance(*p, key) <= KEY_TOLERANCE) {
+        return true;
+    }
+    let keyed = img
+        .pixels()
+        .filter(|p| color_distance(p.0, key) <= KEY_TOLERANCE)
+        .count();
+    keyed as f32 / (img.width() as f32 * img.height() as f32) >= 0.05
 }
 
 fn anchor_offset(anchor: Anchor, cw: u32, ch: u32, iw: u32, ih: u32) -> (u32, u32) {
@@ -1509,12 +2039,14 @@ mod tests {
     fn parses_size() {
         assert_eq!(parse_size("1280x720").unwrap(), (1280, 720));
         assert!(parse_size("1280,720").is_err());
+        assert!(parse_size("0x720").is_err());
     }
 
     #[test]
     fn parses_box() {
         assert_eq!(parse_box("1,2,3,4").unwrap(), (1, 2, 3, 4));
         assert!(parse_box("1,2,3").is_err());
+        assert!(parse_box("1,2,0,4").is_err());
     }
 
     #[test]
@@ -1529,5 +2061,198 @@ mod tests {
         img.put_pixel(1, 2, Rgba([255, 255, 255, 255]));
         let out = trim_alpha(&img).unwrap();
         assert_eq!(out.dimensions(), (1, 1));
+    }
+
+    #[test]
+    fn detects_green_source_background() {
+        let green = RgbaImage::from_pixel(8, 8, Rgba([0, 255, 0, 255]));
+        assert!(green_source_has_key_background(&green, [0, 255, 0]));
+
+        let red = RgbaImage::from_pixel(8, 8, Rgba([255, 0, 0, 255]));
+        assert!(!green_source_has_key_background(&red, [0, 255, 0]));
+    }
+
+    #[test]
+    fn resolves_absolute_executable_paths() {
+        let current = std::env::current_exe().unwrap();
+        assert_eq!(
+            resolve_executable(current.to_str().unwrap()).unwrap(),
+            current
+        );
+        assert!(resolve_executable("/definitely/missing/game-asset").is_none());
+    }
+
+    #[test]
+    fn rejects_small_contact_sheet_cell() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("input.png");
+        let output = dir.path().join("contact.png");
+        save_rgba_atomic(
+            &input,
+            &RgbaImage::from_pixel(16, 16, Rgba([255, 0, 0, 255])),
+            false,
+        )
+        .unwrap();
+        let err = contact_sheet(
+            &Ctx {
+                json: false,
+                quiet: true,
+                include_prompts: false,
+            },
+            ContactSheetArgs {
+                inputs: vec![input.display().to_string()],
+                out: output,
+                cols: 1,
+                cell: 8,
+                overwrite: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 2);
+    }
+
+    #[test]
+    fn rejects_invalid_sfx_parameters() {
+        let dir = TempDir::new().unwrap();
+        let err = audio_sfx(
+            &Ctx {
+                json: false,
+                quiet: true,
+                include_prompts: false,
+            },
+            AudioSfxArgs {
+                preset: SfxPreset::Coin,
+                duration_ms: 260,
+                pitch: None,
+                seed: 0,
+                sample_rate: 0,
+                out: Some(dir.path().join("bad.wav")),
+                out_dir: None,
+                variations: 1,
+                overwrite: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 2);
+    }
+
+    #[test]
+    fn rejects_zero_waveform_dimensions_without_temp_file() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("input.wav");
+        let output = dir.path().join("wave.png");
+        render_sfx_file(&input, SfxPreset::Coin, 100, None, 0, 44100, false).unwrap();
+        let err = audio_waveform(
+            &Ctx {
+                json: false,
+                quiet: true,
+                include_prompts: false,
+            },
+            AudioWaveformArgs {
+                input,
+                out: output.clone(),
+                width: 0,
+                height: 120,
+                overwrite: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(!temp_path_for(&output).exists());
+    }
+
+    #[test]
+    fn despill_leaves_far_colors_untouched() {
+        // A teal pixel far from pure green must not be desaturated.
+        let mut teal = [0u8, 200, 180, 255];
+        let key = [0u8, 255, 0];
+        let d = color_distance(teal, key);
+        apply_despill(&mut teal, key, d, 42.0, 0.75);
+        assert_eq!(teal, [0, 200, 180, 255]);
+
+        // A near-key spill pixel (light green tint) does get its green pulled down.
+        let mut spill = [40u8, 230, 40, 255];
+        let d = color_distance(spill, key);
+        apply_despill(&mut spill, key, d, 42.0, 0.75);
+        assert!(spill[1] < 230);
+    }
+
+    #[test]
+    fn require_wav_extension_rejects_mp3() {
+        assert!(require_wav_extension(Path::new("song.mp3")).is_err());
+        assert!(require_wav_extension(Path::new("clip.wav")).is_ok());
+        assert!(require_wav_extension(Path::new("CLIP.WAV")).is_ok());
+    }
+
+    #[test]
+    fn trims_24bit_and_float_wav() {
+        let dir = TempDir::new().unwrap();
+        for (name, fmt, bits) in [
+            ("p24.wav", hound::SampleFormat::Int, 24),
+            ("f32.wav", hound::SampleFormat::Float, 32),
+        ] {
+            let path = dir.path().join(name);
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 44100,
+                bits_per_sample: bits,
+                sample_format: fmt,
+            };
+            let mut w = hound::WavWriter::create(&path, spec).unwrap();
+            for i in 0..44100 {
+                match fmt {
+                    hound::SampleFormat::Int => {
+                        w.write_sample((i % 1000) as i32).unwrap();
+                    }
+                    hound::SampleFormat::Float => {
+                        w.write_sample((i as f32 / 44100.0) - 0.5).unwrap();
+                    }
+                }
+            }
+            w.finalize().unwrap();
+            let out = dir.path().join(format!("trim_{name}"));
+            audio_trim(
+                &Ctx {
+                    json: false,
+                    quiet: true,
+                    include_prompts: false,
+                },
+                AudioTrimArgs {
+                    input: path,
+                    start: 0.1,
+                    end: 0.3,
+                    out: out.clone(),
+                    overwrite: false,
+                },
+            )
+            .unwrap();
+            let r = hound::WavReader::open(&out).unwrap();
+            assert_eq!(r.spec().bits_per_sample, bits);
+            // ~0.2s at 44.1kHz
+            assert!((r.duration() as i64 - 8820).abs() < 4);
+        }
+    }
+
+    #[test]
+    fn manifest_single_file_uses_file_name() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("solo.wav");
+        render_sfx_file(&input, SfxPreset::Coin, 50, None, 0, 44100, false).unwrap();
+        let out = dir.path().join("m.json");
+        manifest(
+            &Ctx {
+                json: false,
+                quiet: true,
+                include_prompts: false,
+            },
+            ManifestArgs {
+                input,
+                out: out.clone(),
+                overwrite: false,
+            },
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+        assert_eq!(v.pointer("/assets/0/path").and_then(Value::as_str), Some("solo.wav"));
     }
 }
