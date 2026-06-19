@@ -1183,6 +1183,17 @@ fn audio_trim(ctx: &Ctx, args: AudioTrimArgs) -> Result<()> {
     let channels = spec.channels as usize;
     let start = (args.start * spec.sample_rate as f32) as usize * channels;
     let end = (args.end * spec.sample_rate as f32) as usize * channels;
+    let total_samples = reader.len() as usize;
+    if start >= total_samples {
+        let duration = total_samples as f32 / (spec.sample_rate.max(1) as f32 * channels.max(1) as f32);
+        return Err(CliError::new(
+            2,
+            format!(
+                "--start ({:.3}s) is at or beyond input duration ({:.3}s)",
+                args.start, duration
+            ),
+        ));
+    }
     let tmp = temp_path_for(&args.out);
     let result: Result<()> = (|| {
         let mut writer = hound::WavWriter::create(&tmp, spec)
@@ -1372,7 +1383,7 @@ fn doctor(ctx: &Ctx) -> Result<()> {
                 "temp_dir_writable": temp_dir_writable
             }),
         );
-    } else {
+    } else if !ctx.quiet {
         println!(
             "codex: {}",
             codex
@@ -1841,9 +1852,23 @@ fn read_prompt(path: Option<&Path>, text: Option<&str>) -> Result<String> {
             2,
             "use either --prompt or --prompt-text, not both",
         )),
-        (Some(path), None) => fs::read_to_string(path)
-            .map_err(|e| CliError::new(3, format!("{}: {e}", path.display()))),
-        (None, Some(text)) => Ok(text.to_string()),
+        (Some(path), None) => {
+            let content = fs::read_to_string(path)
+                .map_err(|e| CliError::new(3, format!("{}: {e}", path.display())))?;
+            if content.trim().is_empty() {
+                return Err(CliError::new(
+                    2,
+                    format!("prompt file is empty: {}", path.display()),
+                ));
+            }
+            Ok(content)
+        }
+        (None, Some(text)) => {
+            if text.trim().is_empty() {
+                return Err(CliError::new(2, "prompt is empty"));
+            }
+            Ok(text.to_string())
+        }
         (None, None) => Err(CliError::new(2, "prompt is required")),
     }
 }
@@ -2638,5 +2663,73 @@ mod tests {
         .unwrap();
         let v: Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
         assert_eq!(v.pointer("/assets/0/path").and_then(Value::as_str), Some("solo.wav"));
+    }
+
+    #[test]
+    fn trim_start_beyond_input_errors_instead_of_empty_wav() {
+        // A --start past the end of the input used to write a 0-sample WAV and
+        // report success; it must now fail with exit code 2 and write nothing.
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("short.wav"); // ~0.5s mono
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&input, spec).unwrap();
+        for i in 0..22050 {
+            w.write_sample((i % 1000) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+        let out = dir.path().join("trim.wav");
+        let err = audio_trim(
+            &Ctx {
+                json: false,
+                quiet: true,
+                include_prompts: false,
+                pending_start: Mutex::new(None),
+            },
+            AudioTrimArgs {
+                input,
+                start: 5.0,
+                end: 6.0,
+                out: out.clone(),
+                overwrite: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(!out.exists(), "no output file should be written");
+    }
+
+    #[test]
+    fn read_prompt_rejects_empty_and_whitespace_text() {
+        assert!(read_prompt(None, Some("")).is_err());
+        assert!(read_prompt(None, Some("   \n\t ")).is_err());
+        assert_eq!(read_prompt(None, Some("")).unwrap_err().code, 2);
+        // A real prompt still passes through verbatim.
+        assert_eq!(read_prompt(None, Some(" hi ")).unwrap(), " hi ");
+    }
+
+    #[test]
+    fn read_prompt_rejects_empty_file() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("empty.md");
+        fs::write(&p, "   \n").unwrap();
+        let err = read_prompt(Some(&p), None).unwrap_err();
+        assert_eq!(err.code, 2);
+    }
+
+    #[test]
+    fn doctor_respects_quiet() {
+        // --quiet doctor must emit nothing on stdout/stderr and still exit Ok.
+        doctor(&Ctx {
+            json: false,
+            quiet: true,
+            include_prompts: false,
+            pending_start: Mutex::new(None),
+        })
+        .unwrap();
     }
 }
