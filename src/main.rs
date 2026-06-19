@@ -413,6 +413,11 @@ enum Anchor {
     BottomCenter,
 }
 
+enum KeyMode {
+    Auto,
+    Fixed([u8; 3]),
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum SfxPreset {
     Click,
@@ -453,7 +458,32 @@ impl From<io::Error> for CliError {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // clap handles its own --help/--version/usage output. But when the
+            // caller asked for --json, a parse failure must still honor the
+            // documented contract: a single {"type":"error",...} object on stdout
+            // rather than clap's plain-text usage on stderr.
+            use clap::error::ErrorKind;
+            let wants_json = env::args().skip(1).any(|a| a == "--json");
+            let display_only = matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            if wants_json && !display_only {
+                let code = err.exit_code();
+                println!(
+                    "{}",
+                    json!({"type": "error", "code": code, "message": err.to_string()})
+                );
+                std::process::exit(code);
+            }
+            err.exit();
+        }
+    };
     let json = cli.json;
     let started = Instant::now();
     let code = match run(cli, started).await {
@@ -704,6 +734,13 @@ fn image_crop(ctx: &Ctx, args: CropArgs) -> Result<()> {
 fn image_chroma_key(ctx: &Ctx, args: ChromaKeyArgs) -> Result<()> {
     ensure_output(&args.out, args.overwrite)?;
     let key = parse_hex_color(&args.key)?;
+    // Reject non-finite/negative numerics up front. Without this, --tolerance NaN
+    // keys nothing yet still drives despill (band=NaN) and silently discolors the
+    // image, and a negative tolerance is a silent no-op masking a user typo.
+    validate_nonnegative_f32("--tolerance", args.tolerance)?;
+    validate_nonnegative_f32("--despill", args.despill)?;
+    validate_nonnegative_f32("--feather", args.feather)?;
+    warn_if_alpha_dropping_format(ctx, &args.out);
     let img =
         image::open(&args.input).map_err(|e| CliError::new(3, format!("decode image: {e}")))?;
     let mut rgba = img.to_rgba8();
@@ -739,6 +776,7 @@ fn image_chroma_key(ctx: &Ctx, args: ChromaKeyArgs) -> Result<()> {
 
 fn sprite_normalize(ctx: &Ctx, args: SpriteNormalizeArgs) -> Result<()> {
     ensure_output(&args.out, args.overwrite)?;
+    warn_if_alpha_dropping_format(ctx, &args.out);
     let (tw, th) = parse_size(&args.size)?;
     let img =
         image::open(&args.input).map_err(|e| CliError::new(3, format!("decode image: {e}")))?;
@@ -808,6 +846,12 @@ fn sprite_sheet_slice(ctx: &Ctx, args: SheetSliceArgs) -> Result<()> {
 
 fn sprite_sheet_pack(ctx: &Ctx, args: SheetPackArgs) -> Result<()> {
     ensure_output(&args.out, args.overwrite)?;
+    // Guard the sidecar with the same existence check as the image so a metadata
+    // path is never clobbered without --overwrite, and the check happens before
+    // any work rather than after the sheet is already written.
+    if let Some(meta) = &args.metadata_out {
+        check_output_available(meta, args.overwrite)?;
+    }
     validate_positive_u32("--cols", args.cols)?;
     let mut files: Vec<PathBuf> = fs::read_dir(&args.input_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -824,7 +868,8 @@ fn sprite_sheet_pack(ctx: &Ctx, args: SheetPackArgs) -> Result<()> {
     let frame_h = first.height();
     let cols = args.cols;
     let rows = (files.len() as u32 + cols - 1) / cols;
-    let mut sheet = RgbaImage::from_pixel(cols * frame_w, rows * frame_h, Rgba([0, 0, 0, 0]));
+    let (sheet_w, sheet_h) = checked_canvas_dims(cols, rows, frame_w, frame_h)?;
+    let mut sheet = RgbaImage::from_pixel(sheet_w, sheet_h, Rgba([0, 0, 0, 0]));
     let mut frames = Vec::new();
     for (i, file) in files.iter().enumerate() {
         let img = image::open(file)
@@ -854,7 +899,7 @@ fn sprite_sheet_pack(ctx: &Ctx, args: SheetPackArgs) -> Result<()> {
         write_json_atomic(
             &meta,
             &json!({"image": args.out, "frame_width": frame_w, "frame_height": frame_h, "frames": frames}),
-            true,
+            args.overwrite,
         )?;
     }
     ctx.event("artifact", json!({"path": args.out, "kind": "image"}));
@@ -879,6 +924,14 @@ fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
     if which::which("ffmpeg").is_err() {
         return Err(CliError::new(5, "ffmpeg not found in PATH"));
     }
+    // Resolve --key BEFORE shelling out to ffmpeg. An invalid color used to be
+    // parsed only after frames were written, so a typo left orphaned PNGs behind
+    // and failed late. "auto" is resolved from the produced frames further down.
+    let key_mode = match args.key.as_deref() {
+        None => None,
+        Some("auto") => Some(KeyMode::Auto),
+        Some(hex) => Some(KeyMode::Fixed(parse_hex_color(hex)?)),
+    };
     if args.out_dir.exists() && !args.overwrite {
         return Err(CliError::new(
             4,
@@ -939,10 +992,16 @@ fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
             }),
         );
     }
-    if let Some(key) = args.key.as_deref().filter(|k| *k != "auto") {
-        let key = parse_hex_color(key)?;
-        for file in sorted_pngs(&args.out_dir)? {
-            let mut rgba = image::open(&file)
+    if let Some(mode) = key_mode {
+        let files = sorted_pngs(&args.out_dir)?;
+        // "auto" detects the background color from the corners of the first frame;
+        // a fixed hex keys that exact color. Either way every frame is keyed out.
+        let key = match mode {
+            KeyMode::Fixed(k) => k,
+            KeyMode::Auto => detect_key_color(&files)?,
+        };
+        for file in &files {
+            let mut rgba = image::open(file)
                 .map_err(|e| CliError::new(3, format!("{}: {e}", file.display())))?
                 .to_rgba8();
             for pixel in rgba.pixels_mut() {
@@ -950,7 +1009,7 @@ fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
                     pixel.0[3] = 0;
                 }
             }
-            save_rgba_atomic(&file, &rgba, true)?;
+            save_rgba_atomic(file, &rgba, true)?;
         }
     }
     for file in sorted_pngs(&args.out_dir)? {
@@ -961,10 +1020,21 @@ fn video_slice(ctx: &Ctx, args: VideoSliceArgs) -> Result<()> {
 
 async fn audio_bgm(ctx: &Ctx, args: AudioBgmArgs) -> Result<()> {
     check_output_available(&args.out, args.overwrite)?;
-    validate_positive_u32("--sample-rate", args.sample_rate)?;
+    validate_sample_rate(args.sample_rate)?;
     validate_positive_u32("--bitrate", args.bitrate)?;
     let prompt = read_prompt(args.prompt.as_deref(), args.prompt_text.as_deref())?;
-    let lyrics = read_prompt(args.lyrics.as_deref(), args.lyrics_text.as_deref()).ok();
+    // Only treat lyrics as absent when the user supplied neither source. If they
+    // did supply one, propagate read errors (missing file, both flags) instead of
+    // swallowing them with .ok() — otherwise a typo'd path silently yields empty
+    // lyrics, or misreports as "vocals require --lyrics".
+    let lyrics = if args.lyrics.is_some() || args.lyrics_text.is_some() {
+        Some(read_prompt(
+            args.lyrics.as_deref(),
+            args.lyrics_text.as_deref(),
+        )?)
+    } else {
+        None
+    };
     if !args.instrumental && lyrics.is_none() && !args.lyrics_optimizer {
         return Err(CliError::new(
             2,
@@ -1056,7 +1126,7 @@ async fn audio_bgm(ctx: &Ctx, args: AudioBgmArgs) -> Result<()> {
 
 fn audio_sfx(ctx: &Ctx, args: AudioSfxArgs) -> Result<()> {
     validate_positive_u32("--duration-ms", args.duration_ms)?;
-    validate_positive_u32("--sample-rate", args.sample_rate)?;
+    validate_sample_rate(args.sample_rate)?;
     validate_positive_u32("--variations", args.variations)?;
     if let Some(pitch) = args.pitch {
         validate_positive_f32("--pitch", pitch)?;
@@ -1089,7 +1159,7 @@ fn audio_sfx(ctx: &Ctx, args: AudioSfxArgs) -> Result<()> {
                 args.preset,
                 args.duration_ms,
                 args.pitch,
-                args.seed + i as u64,
+                args.seed.wrapping_add(i as u64),
                 args.sample_rate,
                 args.overwrite,
             )?;
@@ -1206,8 +1276,8 @@ fn contact_sheet(ctx: &Ctx, args: ContactSheetArgs) -> Result<()> {
     }
     let cols = args.cols;
     let rows = ((files.len() as u32) + cols - 1) / cols;
-    let mut sheet =
-        RgbaImage::from_pixel(cols * args.cell, rows * args.cell, Rgba([24, 26, 30, 255]));
+    let (sheet_w, sheet_h) = checked_canvas_dims(cols, rows, args.cell, args.cell)?;
+    let mut sheet = RgbaImage::from_pixel(sheet_w, sheet_h, Rgba([24, 26, 30, 255]));
     for (i, file) in files.iter().enumerate() {
         let img =
             image::open(file).map_err(|e| CliError::new(3, format!("{}: {e}", file.display())))?;
@@ -1830,6 +1900,103 @@ fn validate_timeout(seconds: u64) -> Result<()> {
     Ok(())
 }
 
+// 768 kHz comfortably covers any real audio workflow while keeping the WAV
+// byte-rate (sample_rate * channels * bytes_per_sample) far below the u32 ceiling
+// that `hound` multiplies into, which otherwise panics on absurd values.
+const MAX_SAMPLE_RATE: u32 = 768_000;
+
+fn validate_sample_rate(value: u32) -> Result<()> {
+    validate_positive_u32("--sample-rate", value)?;
+    if value > MAX_SAMPLE_RATE {
+        return Err(CliError::new(
+            2,
+            format!("--sample-rate must be between 1 and {MAX_SAMPLE_RATE}"),
+        ));
+    }
+    Ok(())
+}
+
+// Cap each canvas axis so a huge cols/cell (or frame count) can't overflow the
+// u32 multiply — which panics in debug and silently wraps into a corrupt image in
+// release — or balloon into a multi-gigabyte allocation.
+const MAX_CANVAS_DIM: u32 = 16_384;
+
+fn checked_canvas_dims(cols: u32, rows: u32, cell_w: u32, cell_h: u32) -> Result<(u32, u32)> {
+    let width = cols
+        .checked_mul(cell_w)
+        .filter(|d| *d <= MAX_CANVAS_DIM)
+        .ok_or_else(|| {
+            CliError::new(
+                2,
+                format!("sheet width ({cols} x {cell_w}px) exceeds the {MAX_CANVAS_DIM}px limit"),
+            )
+        })?;
+    let height = rows
+        .checked_mul(cell_h)
+        .filter(|d| *d <= MAX_CANVAS_DIM)
+        .ok_or_else(|| {
+            CliError::new(
+                2,
+                format!("sheet height ({rows} x {cell_h}px) exceeds the {MAX_CANVAS_DIM}px limit"),
+            )
+        })?;
+    Ok((width, height))
+}
+
+fn warn_if_alpha_dropping_format(ctx: &Ctx, out: &Path) {
+    let ext = out
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(ext.as_str(), "jpg" | "jpeg") {
+        ctx.event(
+            "warning",
+            json!({
+                "message": format!(
+                    "output '.{ext}' cannot store transparency; the alpha channel will be \
+discarded. Use a .png output to preserve transparency."
+                )
+            }),
+        );
+    }
+}
+
+/// Detect a chroma key color from the corners of the first frame for `--key auto`:
+/// pick the corner color shared by the most corners (ties resolve to top-left).
+fn detect_key_color(files: &[PathBuf]) -> Result<[u8; 3]> {
+    let first = files
+        .first()
+        .ok_or_else(|| CliError::new(6, "no frames available to auto-detect a key color"))?;
+    let img = image::open(first)
+        .map_err(|e| CliError::new(3, format!("{}: {e}", first.display())))?
+        .to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return Err(CliError::new(3, "first frame is empty"));
+    }
+    let corners = [
+        img.get_pixel(0, 0).0,
+        img.get_pixel(w - 1, 0).0,
+        img.get_pixel(0, h - 1).0,
+        img.get_pixel(w - 1, h - 1).0,
+    ];
+    let mut best = corners[0];
+    let mut best_count = 0;
+    for c in &corners {
+        let key = [c[0], c[1], c[2]];
+        let count = corners
+            .iter()
+            .filter(|o| color_distance(**o, key) <= 24.0)
+            .count();
+        if count > best_count {
+            best_count = count;
+            best = *c;
+        }
+    }
+    Ok([best[0], best[1], best[2]])
+}
+
 fn codex_sandbox() -> Result<String> {
     let sandbox = env::var("CODEX_SANDBOX").unwrap_or_else(|_| "workspace-write".into());
     match sandbox.as_str() {
@@ -2393,6 +2560,60 @@ mod tests {
             // ~0.2s at 44.1kHz
             assert!((r.duration() as i64 - 8820).abs() < 4);
         }
+    }
+
+    #[test]
+    fn checked_canvas_dims_rejects_overflow() {
+        // The contact-sheet / sheet-pack panic: 70000 * 70000 overflows u32.
+        assert!(checked_canvas_dims(70_000, 70_000, 70_000, 70_000).is_err());
+        assert!(checked_canvas_dims(1, 1, u32::MAX, 1).is_err());
+        // A sane sheet still passes.
+        assert_eq!(checked_canvas_dims(6, 3, 160, 160).unwrap(), (960, 480));
+    }
+
+    #[test]
+    fn validate_sample_rate_bounds() {
+        assert!(validate_sample_rate(0).is_err());
+        assert!(validate_sample_rate(u32::MAX).is_err());
+        assert!(validate_sample_rate(44_100).is_ok());
+        assert!(validate_sample_rate(MAX_SAMPLE_RATE).is_ok());
+    }
+
+    #[test]
+    fn detect_key_color_picks_majority_corner() {
+        let dir = TempDir::new().unwrap();
+        // Three green corners, one red: auto should pick green.
+        let mut img = RgbaImage::from_pixel(8, 8, Rgba([0, 255, 0, 255]));
+        img.put_pixel(7, 7, Rgba([255, 0, 0, 255]));
+        let path = dir.path().join("frame_000.png");
+        save_rgba_atomic(&path, &img, false).unwrap();
+        assert_eq!(detect_key_color(&[path]).unwrap(), [0, 255, 0]);
+    }
+
+    #[test]
+    fn sfx_variation_seed_does_not_overflow() {
+        // --seed u64::MAX with >1 variation used to overflow on the +i.
+        let dir = TempDir::new().unwrap();
+        audio_sfx(
+            &Ctx {
+                json: false,
+                quiet: true,
+                include_prompts: false,
+                pending_start: Mutex::new(None),
+            },
+            AudioSfxArgs {
+                preset: SfxPreset::Coin,
+                duration_ms: 20,
+                pitch: None,
+                seed: u64::MAX,
+                sample_rate: 44100,
+                out: None,
+                out_dir: Some(dir.path().join("out")),
+                variations: 2,
+                overwrite: false,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
