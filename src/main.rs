@@ -397,6 +397,7 @@ struct ManifestArgs {
 #[derive(Clone, ValueEnum)]
 enum ImageKind {
     Scene,
+    Concept,
     Background,
     Character,
     Sprite,
@@ -2732,6 +2733,7 @@ fn clear_frame_pngs(dir: &Path) -> Result<()> {
 fn image_kind_name(kind: &ImageKind) -> &'static str {
     match kind {
         ImageKind::Scene => "scene",
+        ImageKind::Concept => "concept",
         ImageKind::Background => "background",
         ImageKind::Character => "character",
         ImageKind::Sprite => "sprite",
