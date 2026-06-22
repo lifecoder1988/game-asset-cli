@@ -29,6 +29,10 @@ struct Cli {
     quiet: bool,
     #[arg(long = "json-include-prompts", global = true)]
     json_include_prompts: bool,
+    /// Print verbose generation logs to stderr (resolved command, full
+    /// provider instruction, and the provider's own streamed output).
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -530,6 +534,7 @@ async fn run(cli: Cli, started: Instant) -> Result<()> {
         json: cli.json,
         quiet: cli.quiet,
         include_prompts: cli.json_include_prompts,
+        verbose: cli.verbose,
         pending_start: Mutex::new(None),
     };
     let (command_name, out) = command_label(&cli.command);
@@ -573,6 +578,7 @@ struct Ctx {
     json: bool,
     quiet: bool,
     include_prompts: bool,
+    verbose: bool,
     // The `start` event is buffered here and only flushed once the first real
     // event (provider_request/artifact/warning/done) is emitted. A command that
     // fails during validation never produces a real event, so on the error path
@@ -617,6 +623,15 @@ fn command_label(command: &Commands) -> (String, Option<String>) {
 }
 
 impl Ctx {
+    /// Emit a diagnostic line to stderr when `--verbose` is set. Independent of
+    /// the stdout JSON contract (always stderr) and of `--quiet` (verbose is an
+    /// explicit opt-in), so it never corrupts machine-readable output.
+    fn vlog(&self, msg: impl AsRef<str>) {
+        if self.verbose {
+            eprintln!("[verbose] {}", msg.as_ref());
+        }
+    }
+
     fn event(&self, typ: &str, value: Value) {
         if typ == "start" {
             *self.pending_start.lock().unwrap() = Some(value);
@@ -1870,6 +1885,22 @@ async fn run_codex_image(
             fs::canonicalize(r).map_err(|e| CliError::new(3, format!("{}: {e}", r.display())))?,
         );
     }
+    let rel_out = "asset.png";
+    let final_instruction = format!(
+        "{instruction}\n\n\
+Output handling (follow exactly):\n\
+- Generate the image with the built-in image_gen tool in THIS session for THIS request.\n\
+- Then materialize the PNG that YOUR image_gen call just produced in this session into `{rel_out}` in the current working directory. The image_gen result is the base64 PNG payload of your own `image_generation_call` in this session's rollout; decode that exact payload to `{rel_out}` (for example with `base64 -D`). Use only the result of the call you just made.\n\
+- Do NOT scan `$CODEX_HOME/generated_images` or any other directory for the newest PNG by modification time. Those locations accumulate unrelated images from previous sessions, so picking the latest file will copy the wrong image.\n\
+- After writing it, open `{rel_out}` with the view_image tool and confirm it matches the requested subject. If it does not match, or if no image was generated in this session, regenerate. Never substitute a pre-existing, stale, or unrelated file.\n\
+- On success, `{rel_out}` must be the ONLY .png in the current working directory and must be the image you just generated. Create parent directories if needed. Do not write any project files, manifests, scripts, or extra state beyond `{rel_out}`.\n\
+- If image generation is unavailable or fails, exit with a non-zero status. Do NOT copy any placeholder or stale image to `{rel_out}`."
+    );
+    // Logged here (before the dry-run return) so `--verbose --dry-run` previews
+    // the exact, full instruction without ever invoking codex.
+    ctx.vlog(format!(
+        "full provider instruction follows:\n{final_instruction}"
+    ));
     if dry_run {
         let mut event = json!({
             "provider": "codex-image",
@@ -1890,17 +1921,25 @@ async fn run_codex_image(
         .ok_or_else(|| CliError::new(5, format!("{codex_bin} not found or not executable")))?;
     let sandbox = codex_sandbox()?;
     let tmpdir = TempDir::new().map_err(|e| CliError::new(1, e.to_string()))?;
-    let rel_out = "asset.png";
-    let final_instruction = format!(
-        "{instruction}\n\n\
-Output handling (follow exactly):\n\
-- Generate the image with the built-in image_gen tool in THIS session for THIS request.\n\
-- Then materialize the PNG that YOUR image_gen call just produced in this session into `{rel_out}` in the current working directory. The image_gen result is the base64 PNG payload of your own `image_generation_call` in this session's rollout; decode that exact payload to `{rel_out}` (for example with `base64 -D`). Use only the result of the call you just made.\n\
-- Do NOT scan `$CODEX_HOME/generated_images` or any other directory for the newest PNG by modification time. Those locations accumulate unrelated images from previous sessions, so picking the latest file will copy the wrong image.\n\
-- After writing it, open `{rel_out}` with the view_image tool and confirm it matches the requested subject. If it does not match, or if no image was generated in this session, regenerate. Never substitute a pre-existing, stale, or unrelated file.\n\
-- On success, `{rel_out}` must be the ONLY .png in the current working directory and must be the image you just generated. Create parent directories if needed. Do not write any project files, manifests, scripts, or extra state beyond `{rel_out}`.\n\
-- If image generation is unavailable or fails, exit with a non-zero status. Do NOT copy any placeholder or stale image to `{rel_out}`."
-    );
+    if ctx.verbose {
+        ctx.vlog(format!("codex binary: {}", codex_path.display()));
+        ctx.vlog(format!("sandbox: {sandbox}"));
+        ctx.vlog(format!("working dir: {}", tmpdir.path().display()));
+        ctx.vlog(format!("model: {}", model.unwrap_or("(default)")));
+        ctx.vlog(format!(
+            "reference images: {}",
+            if canonical_refs.is_empty() {
+                "(none)".to_string()
+            } else {
+                canonical_refs
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        ctx.vlog(format!("timeout: {timeout_seconds}s"));
+    }
     let mut cmd = TokioCommand::new(codex_path);
     // NOTE: do not pass --ephemeral. Under --ephemeral codex does not persist the
     // session rollout, so the agent cannot recover the base64 PNG produced by its
@@ -1935,20 +1974,32 @@ Output handling (follow exactly):\n\
     //
     // stdout is sent to /dev/null (codex streams verbose agent logs there; if we
     // piped it without draining, the pipe buffer would fill and deadlock codex
-    // before it ever wrote the image). stderr is piped and drained concurrently
-    // so the last line is still available for error reporting.
+    // before it ever wrote the image). Under --verbose we instead `inherit` it so
+    // the agent log streams straight to the terminal — inherit shares our own fd,
+    // so there is no pipe we own to overflow. stderr is piped and drained
+    // concurrently so the last line is still available for error reporting; under
+    // --verbose the drained buffer is also echoed to our stderr.
+    let stdout_target = if ctx.verbose {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    };
     let mut child = cmd
-        .stdout(Stdio::null())
+        .stdout(stdout_target)
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| CliError::new(6, format!("run codex: {e}")))?;
     let stderr_tail = std::sync::Arc::new(Mutex::new(String::new()));
     if let Some(mut err) = child.stderr.take() {
         let sink = stderr_tail.clone();
+        let echo = ctx.verbose;
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
             let mut buf = String::new();
             let _ = err.read_to_string(&mut buf).await;
+            if echo && !buf.is_empty() {
+                eprint!("{buf}");
+            }
             *sink.lock().unwrap() = buf;
         });
     }
@@ -2003,8 +2054,14 @@ Output handling (follow exactly):\n\
             })?
         }
     };
+    ctx.vlog(format!("selected generated image: {}", generated.display()));
     let generated_img = image::open(&generated)
         .map_err(|e| CliError::new(7, format!("generated file is not an image: {e}")))?;
+    ctx.vlog(format!(
+        "decoded image: {}x{}",
+        generated_img.width(),
+        generated_img.height()
+    ));
     if let Some((expected_w, expected_h)) = requested_size {
         if generated_img.width() != expected_w || generated_img.height() != expected_h {
             ctx.event(
@@ -2853,6 +2910,7 @@ mod tests {
                 json: false,
                 quiet: true,
                 include_prompts: false,
+                verbose: false,
                 pending_start: Mutex::new(None),
             },
             ContactSheetArgs {
@@ -2875,6 +2933,7 @@ mod tests {
                 json: false,
                 quiet: true,
                 include_prompts: false,
+                verbose: false,
                 pending_start: Mutex::new(None),
             },
             AudioSfxArgs {
@@ -2904,6 +2963,7 @@ mod tests {
                 json: false,
                 quiet: true,
                 include_prompts: false,
+                verbose: false,
                 pending_start: Mutex::new(None),
             },
             AudioWaveformArgs {
@@ -2974,6 +3034,7 @@ mod tests {
                     json: false,
                     quiet: true,
                     include_prompts: false,
+                    verbose: false,
                     pending_start: Mutex::new(None),
                 },
                 AudioTrimArgs {
@@ -3029,6 +3090,7 @@ mod tests {
                 json: false,
                 quiet: true,
                 include_prompts: false,
+                verbose: false,
                 pending_start: Mutex::new(None),
             },
             AudioSfxArgs {
@@ -3057,6 +3119,7 @@ mod tests {
                 json: false,
                 quiet: true,
                 include_prompts: false,
+                verbose: false,
                 pending_start: Mutex::new(None),
             },
             ManifestArgs {
@@ -3096,6 +3159,7 @@ mod tests {
                 json: false,
                 quiet: true,
                 include_prompts: false,
+                verbose: false,
                 pending_start: Mutex::new(None),
             },
             AudioTrimArgs {
@@ -3136,6 +3200,7 @@ mod tests {
             json: false,
             quiet: true,
             include_prompts: false,
+            verbose: false,
             pending_start: Mutex::new(None),
         })
         .unwrap();
