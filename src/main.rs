@@ -581,10 +581,7 @@ fn command_label(command: &Commands) -> (String, Option<String>) {
             AudioSubcommand::Bgm(a) => ("audio.bgm".into(), Some(display(&a.out))),
             AudioSubcommand::Sfx(a) => (
                 "audio.sfx".into(),
-                a.out
-                    .as_deref()
-                    .or(a.out_dir.as_deref())
-                    .map(display),
+                a.out.as_deref().or(a.out_dir.as_deref()).map(display),
             ),
             AudioSubcommand::Trim(a) => ("audio.trim".into(), Some(display(&a.out))),
             AudioSubcommand::Waveform(a) => ("audio.waveform".into(), Some(display(&a.out))),
@@ -867,7 +864,7 @@ fn sprite_sheet_pack(ctx: &Ctx, args: SheetPackArgs) -> Result<()> {
     let frame_w = first.width();
     let frame_h = first.height();
     let cols = args.cols;
-    let rows = (files.len() as u32 + cols - 1) / cols;
+    let rows = (files.len() as u32).div_ceil(cols);
     let (sheet_w, sheet_h) = checked_canvas_dims(cols, rows, frame_w, frame_h)?;
     let mut sheet = RgbaImage::from_pixel(sheet_w, sheet_h, Rgba([0, 0, 0, 0]));
     let mut frames = Vec::new();
@@ -1185,7 +1182,8 @@ fn audio_trim(ctx: &Ctx, args: AudioTrimArgs) -> Result<()> {
     let end = (args.end * spec.sample_rate as f32) as usize * channels;
     let total_samples = reader.len() as usize;
     if start >= total_samples {
-        let duration = total_samples as f32 / (spec.sample_rate.max(1) as f32 * channels.max(1) as f32);
+        let duration =
+            total_samples as f32 / (spec.sample_rate.max(1) as f32 * channels.max(1) as f32);
         return Err(CliError::new(
             2,
             format!(
@@ -1286,7 +1284,7 @@ fn contact_sheet(ctx: &Ctx, args: ContactSheetArgs) -> Result<()> {
         return Err(CliError::new(3, "no input images matched"));
     }
     let cols = args.cols;
-    let rows = ((files.len() as u32) + cols - 1) / cols;
+    let rows = (files.len() as u32).div_ceil(cols);
     let (sheet_w, sheet_h) = checked_canvas_dims(cols, rows, args.cell, args.cell)?;
     let mut sheet = RgbaImage::from_pixel(sheet_w, sheet_h, Rgba([24, 26, 30, 255]));
     for (i, file) in files.iter().enumerate() {
@@ -1471,6 +1469,7 @@ fn temp_dir_is_writable() -> bool {
         .is_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_codex_image(
     ctx: &Ctx,
     instruction: &str,
@@ -1793,7 +1792,7 @@ fn warn_format_extension(ctx: &Ctx, out: &Path, format: &str) {
             json!({
                 "message": format!(
                     "output extension '.{ext}' does not match --format '{format}'; \
-the file will contain {format}-encoded audio"
+            the file will contain {format}-encoded audio"
                 )
             }),
         );
@@ -1980,7 +1979,7 @@ fn warn_if_alpha_dropping_format(ctx: &Ctx, out: &Path) {
             json!({
                 "message": format!(
                     "output '.{ext}' cannot store transparency; the alpha channel will be \
-discarded. Use a .png output to preserve transparency."
+            discarded. Use a .png output to preserve transparency."
                 )
             }),
         );
@@ -2229,7 +2228,10 @@ fn green_source_has_key_background(img: &RgbaImage, key: [u8; 3]) -> bool {
         img.get_pixel(0, img.height() - 1).0,
         img.get_pixel(img.width() - 1, img.height() - 1).0,
     ];
-    if corners.iter().all(|p| color_distance(*p, key) <= KEY_TOLERANCE) {
+    if corners
+        .iter()
+        .all(|p| color_distance(*p, key) <= KEY_TOLERANCE)
+    {
         return true;
     }
     let keyed = img
@@ -2555,7 +2557,7 @@ mod tests {
             for i in 0..44100 {
                 match fmt {
                     hound::SampleFormat::Int => {
-                        w.write_sample((i % 1000) as i32).unwrap();
+                        w.write_sample(i % 1000).unwrap();
                     }
                     hound::SampleFormat::Float => {
                         w.write_sample((i as f32 / 44100.0) - 0.5).unwrap();
@@ -2662,7 +2664,10 @@ mod tests {
         )
         .unwrap();
         let v: Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
-        assert_eq!(v.pointer("/assets/0/path").and_then(Value::as_str), Some("solo.wav"));
+        assert_eq!(
+            v.pointer("/assets/0/path").and_then(Value::as_str),
+            Some("solo.wav")
+        );
     }
 
     #[test]
