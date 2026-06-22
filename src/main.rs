@@ -49,6 +49,27 @@ enum Commands {
     Manifest(ManifestArgs),
     #[command(about = "Check local provider dependencies and credentials")]
     Doctor,
+    #[command(about = "Self-update to the latest released binary")]
+    Upgrade(UpgradeArgs),
+}
+
+#[derive(Args)]
+struct UpgradeArgs {
+    /// Only report whether a newer version exists; do not download or install.
+    #[arg(long)]
+    check: bool,
+    /// Install this exact release tag instead of the latest (e.g. v0.2.0).
+    #[arg(long)]
+    tag: Option<String>,
+    /// GitHub repository to fetch releases from, as owner/name.
+    #[arg(long, default_value = "lifecoder1988/game-asset-cli")]
+    repo: String,
+    /// Reinstall even when already on the target version.
+    #[arg(long)]
+    force: bool,
+    /// Resolve the release and platform asset but do not download or replace the binary.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -541,6 +562,7 @@ async fn run(cli: Cli, started: Instant) -> Result<()> {
         Commands::ContactSheet(args) => contact_sheet(&ctx, args)?,
         Commands::Manifest(args) => manifest(&ctx, args)?,
         Commands::Doctor => doctor(&ctx)?,
+        Commands::Upgrade(args) => upgrade(&ctx, args).await?,
     }
     ctx.event("done", json!({"elapsed_ms": started.elapsed().as_millis()}));
     Ok(())
@@ -589,6 +611,7 @@ fn command_label(command: &Commands) -> (String, Option<String>) {
         Commands::ContactSheet(a) => ("contact-sheet".into(), Some(display(&a.out))),
         Commands::Manifest(a) => ("manifest".into(), Some(display(&a.out))),
         Commands::Doctor => ("doctor".into(), None),
+        Commands::Upgrade(_) => ("upgrade".into(), None),
     }
 }
 
@@ -1424,6 +1447,357 @@ fn doctor(ctx: &Ctx) -> Result<()> {
             if temp_dir_writable { "yes" } else { "no" }
         );
     }
+    Ok(())
+}
+
+const USER_AGENT: &str = concat!("game-asset/", env!("CARGO_PKG_VERSION"));
+
+async fn upgrade(ctx: &Ctx, args: UpgradeArgs) -> Result<()> {
+    let target = current_target()?;
+    let current = env!("CARGO_PKG_VERSION");
+    let client = reqwest::Client::new();
+
+    // Resolve the release to install: a specific tag, or the latest.
+    let release_url = match &args.tag {
+        Some(tag) => format!(
+            "https://api.github.com/repos/{}/releases/tags/{}",
+            args.repo, tag
+        ),
+        None => format!("https://api.github.com/repos/{}/releases/latest", args.repo),
+    };
+    let mut req = client
+        .get(&release_url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json");
+    if let Some(token) = github_token() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| CliError::new(6, format!("GitHub request failed: {e}")))?;
+    let status = resp.status();
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| CliError::new(6, format!("GitHub response was not JSON: {e}")))?;
+    if !status.is_success() {
+        let detail = body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        let hint = if github_token().is_none() {
+            " (set GITHUB_TOKEN for private repositories or to raise rate limits)"
+        } else {
+            ""
+        };
+        return Err(CliError::new(
+            6,
+            format!("GitHub HTTP {status} for {}: {detail}{hint}", args.repo),
+        ));
+    }
+    let tag = body
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new(6, "release is missing tag_name"))?
+        .to_string();
+    let latest = tag.trim_start_matches('v').to_string();
+    let newer = version_is_newer(&latest, current);
+
+    // --check never installs; it only reports the comparison.
+    if args.check {
+        ctx.event(
+            "upgrade",
+            json!({
+                "current": current,
+                "latest": latest,
+                "tag": tag,
+                "target": target,
+                "update_available": newer,
+            }),
+        );
+        if !ctx.json && !ctx.quiet {
+            if newer {
+                println!("update available: {current} -> {latest}");
+            } else {
+                println!("up to date ({current})");
+            }
+        }
+        return Ok(());
+    }
+
+    // No-op when already current unless the caller forces a reinstall.
+    if !newer && !args.force {
+        ctx.event(
+            "upgrade",
+            json!({
+                "current": current,
+                "latest": latest,
+                "tag": tag,
+                "target": target,
+                "updated": false,
+                "reason": "already up to date",
+            }),
+        );
+        if !ctx.json && !ctx.quiet {
+            println!("already up to date ({current}); use --force to reinstall");
+        }
+        return Ok(());
+    }
+
+    // Pick the asset built for this platform by matching the target triple.
+    let asset = body
+        .get("assets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|a| {
+            a.get("name")
+                .and_then(Value::as_str)
+                .map(|n| n.contains(&target))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            CliError::new(6, format!("release {tag} has no asset for target {target}"))
+        })?;
+    let asset_name = asset
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("asset")
+        .to_string();
+    let asset_url = asset
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new(6, "asset is missing its API url"))?
+        .to_string();
+
+    let dest = env::current_exe()
+        .map_err(|e| CliError::new(1, format!("cannot locate current executable: {e}")))?;
+
+    if args.dry_run {
+        ctx.event(
+            "upgrade",
+            json!({
+                "current": current,
+                "latest": latest,
+                "tag": tag,
+                "target": target,
+                "asset": asset_name,
+                "dest": dest.display().to_string(),
+                "updated": false,
+                "dry_run": true,
+            }),
+        );
+        if !ctx.json && !ctx.quiet {
+            println!(
+                "would install {asset_name} ({current} -> {latest}) to {}",
+                dest.display()
+            );
+        }
+        return Ok(());
+    }
+
+    ctx.event(
+        "provider_request",
+        json!({"provider": "github-release", "asset": asset_name, "tag": tag}),
+    );
+
+    // The asset API url plus an octet-stream Accept header serves the raw bytes
+    // for both public and private repositories. reqwest drops the Authorization
+    // header on the cross-host redirect to the CDN, so the signed URL is honored.
+    let mut dl = client
+        .get(&asset_url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .header(reqwest::header::ACCEPT, "application/octet-stream");
+    if let Some(token) = github_token() {
+        dl = dl.bearer_auth(token);
+    }
+    let dl_resp = dl
+        .send()
+        .await
+        .map_err(|e| CliError::new(6, format!("asset download failed: {e}")))?;
+    let dl_status = dl_resp.status();
+    if !dl_status.is_success() {
+        return Err(CliError::new(6, format!("asset download HTTP {dl_status}")));
+    }
+    let bytes = dl_resp
+        .bytes()
+        .await
+        .map_err(|e| CliError::new(6, format!("reading asset body: {e}")))?;
+
+    // Unpack into a scratch dir and locate the new binary inside it.
+    let work = TempDir::new().map_err(CliError::from)?;
+    let archive = work.path().join(&asset_name);
+    fs::write(&archive, &bytes)?;
+    extract_archive(&archive, work.path())?;
+    let new_bin = find_binary(work.path())?;
+
+    replace_executable(&new_bin, &dest)?;
+
+    ctx.event(
+        "artifact",
+        json!({
+            "path": dest.display().to_string(),
+            "kind": "binary",
+            "version": latest,
+            "tag": tag,
+            "bytes": bytes.len(),
+        }),
+    );
+    if !ctx.json && !ctx.quiet {
+        println!("upgraded {current} -> {latest} ({})", dest.display());
+    }
+    Ok(())
+}
+
+fn github_token() -> Option<String> {
+    env::var("GITHUB_TOKEN")
+        .ok()
+        .or_else(|| env::var("GH_TOKEN").ok())
+        .filter(|t| !t.is_empty())
+}
+
+fn current_target() -> Result<String> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let triple = match (os, arch) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        _ => {
+            return Err(CliError::new(
+                2,
+                format!("no prebuilt binary is published for {os}/{arch}"),
+            ))
+        }
+    };
+    Ok(triple.to_string())
+}
+
+// Compare dotted numeric versions (e.g. "0.2.0" vs "0.1.0") without pulling in a
+// semver dependency. Non-numeric pre-release segments collapse to 0, which is
+// sufficient for the project's plain vMAJOR.MINOR.PATCH tags.
+fn version_is_newer(candidate: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.split(['.', '-', '+'])
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect()
+    };
+    let a = parse(candidate);
+    let b = parse(current);
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
+    // `tar -xf` auto-detects gzip on every platform, and bsdtar (macOS, modern
+    // Windows) also unpacks the .zip asset, so one invocation covers all targets.
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|e| CliError::new(1, format!("failed to run tar: {e}")))?;
+    if !status.success() {
+        return Err(CliError::new(
+            1,
+            format!("tar failed to extract {}", archive.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn find_binary(root: &Path) -> Result<PathBuf> {
+    let want = if cfg!(windows) {
+        "game-asset.exe"
+    } else {
+        "game-asset"
+    };
+    for entry in walkdir::WalkDir::new(root).into_iter().flatten() {
+        if entry.file_type().is_file() && entry.file_name() == OsStr::new(want) {
+            return Ok(entry.path().to_path_buf());
+        }
+    }
+    Err(CliError::new(
+        1,
+        format!("downloaded archive did not contain {want}"),
+    ))
+}
+
+#[cfg(unix)]
+fn replace_executable(new_bin: &Path, dest: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    // Stage beside the destination so the final swap is a same-filesystem rename
+    // (atomic), and replacing a running binary keeps the old inode alive.
+    let staged = dir.join(format!(".game-asset.upgrade.{}", std::process::id()));
+    fs::copy(new_bin, &staged).map_err(|e| {
+        let _ = fs::remove_file(&staged);
+        CliError::new(
+            1,
+            format!(
+                "cannot write to {} ({e}); rerun with adequate permissions",
+                dir.display()
+            ),
+        )
+    })?;
+    if let Err(e) = fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)) {
+        let _ = fs::remove_file(&staged);
+        return Err(CliError::from(e));
+    }
+    fs::rename(&staged, &dest).map_err(|e| {
+        let _ = fs::remove_file(&staged);
+        CliError::new(
+            1,
+            format!("cannot install new executable to {}: {e}", dest.display()),
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_executable(new_bin: &Path, dest: &Path) -> Result<()> {
+    let dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let staged = dir.join(format!(".game-asset.upgrade.{}.exe", std::process::id()));
+    fs::copy(new_bin, &staged).map_err(|e| {
+        let _ = fs::remove_file(&staged);
+        CliError::new(
+            1,
+            format!(
+                "cannot write to {} ({e}); rerun with adequate permissions",
+                dir.display()
+            ),
+        )
+    })?;
+    // Windows cannot overwrite a running executable, so move it aside first and
+    // restore it if the swap fails. The backup is left in place because the old
+    // image may stay locked until this process exits.
+    let backup = dir.join(format!(".game-asset.old.{}.exe", std::process::id()));
+    let _ = fs::remove_file(&backup);
+    fs::rename(&dest, &backup).map_err(|e| {
+        let _ = fs::remove_file(&staged);
+        CliError::new(1, format!("cannot move current executable aside: {e}"))
+    })?;
+    if let Err(e) = fs::rename(&staged, &dest) {
+        let _ = fs::rename(&backup, &dest);
+        let _ = fs::remove_file(&staged);
+        return Err(CliError::new(
+            1,
+            format!("cannot install new executable: {e}"),
+        ));
+    }
+    let _ = fs::remove_file(&backup);
     Ok(())
 }
 
@@ -2405,6 +2779,24 @@ mod tests {
     fn parses_grid() {
         assert_eq!(parse_grid("8x2").unwrap(), (8, 2));
         assert!(parse_grid("0x2").is_err());
+    }
+
+    #[test]
+    fn version_comparison_orders_releases() {
+        assert!(version_is_newer("0.2.0", "0.1.0"));
+        assert!(version_is_newer("1.0.0", "0.9.9"));
+        assert!(version_is_newer("0.1.10", "0.1.2"));
+        assert!(!version_is_newer("0.1.0", "0.1.0"));
+        assert!(!version_is_newer("0.1.0", "0.2.0"));
+        // A leading-v tag is stripped by the caller before comparison.
+        assert!(version_is_newer("0.1.0".trim_start_matches('v'), "0.0.9"));
+    }
+
+    #[test]
+    fn current_target_is_known_for_this_platform() {
+        // The build only runs on supported hosts, so this must resolve a triple.
+        let target = current_target().unwrap();
+        assert!(target.contains('-'));
     }
 
     #[test]

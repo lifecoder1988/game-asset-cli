@@ -60,6 +60,23 @@ game-asset video slice --in effect.mp4 --start 0.4 --end 1.6 --frames 12 --out-d
 
 `video slice` requires `ffmpeg` on `PATH`.
 
+Self-update:
+
+```bash
+game-asset upgrade --check           # report whether a newer release exists
+game-asset upgrade                   # download and install the latest release
+game-asset upgrade --tag v0.2.0      # install a specific tag
+game-asset upgrade --dry-run         # resolve the platform asset without installing
+game-asset upgrade --force           # reinstall even if already current
+```
+
+`upgrade` downloads the release archive for the current platform from GitHub,
+verifies it contains the `game-asset` binary, and atomically replaces the running
+executable in place (no `cargo` toolchain required). Set `GITHUB_TOKEN` (or
+`GH_TOKEN`) for private repositories or to raise the API rate limit, and
+`--repo owner/name` to install from a fork. It requires `tar` on `PATH` and write
+access to the directory holding the binary.
+
 ## Providers
 
 Image generation wraps the local Codex CLI:
