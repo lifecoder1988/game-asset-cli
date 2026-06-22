@@ -2066,6 +2066,7 @@ fn image_instruction(
     key: &str,
 ) -> String {
     let mut s = String::new();
+    s.push_str("$imagegen\n");
     s.push_str("Generate a production-ready 2D game asset.\n");
     s.push_str(&format!("Asset kind: {kind}.\n"));
     if let Some((w, h)) = size {
@@ -2762,6 +2763,14 @@ fn green_kind_name(kind: &GreenKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_instruction_always_includes_imagegen_keyword() {
+        let plain = image_instruction("scene", "a cat", None, None, false, "#00FF00");
+        assert!(plain.contains("$imagegen"), "plain: {plain}");
+        let green = image_instruction("button", "a coin", None, None, true, "#00FF00");
+        assert!(green.contains("$imagegen"), "green: {green}");
+    }
 
     #[test]
     fn parses_size() {
