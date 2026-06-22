@@ -701,6 +701,7 @@ async fn image_generate(ctx: &Ctx, args: ImageGenerateArgs) -> Result<()> {
         size,
         false,
         "#00FF00",
+        &args.out,
     );
     run_codex_image(
         ctx,
@@ -730,6 +731,7 @@ async fn image_green_source(ctx: &Ctx, args: GreenSourceArgs) -> Result<()> {
         None,
         true,
         &args.key_color,
+        &args.out,
     );
     run_codex_image(
         ctx,
@@ -2121,11 +2123,24 @@ fn image_instruction(
     size: Option<(u32, u32)>,
     green: bool,
     key: &str,
+    out: &Path,
 ) -> String {
     let mut s = String::new();
     s.push_str("$imagegen\n");
     s.push_str("Generate a production-ready 2D game asset.\n");
     s.push_str(&format!("Asset kind: {kind}.\n"));
+    // Output-target constraint derived from --out: the deliverable's file name
+    // and image format. This describes the asset to produce; it does NOT change
+    // the codex working-file rules appended later (which still write `asset.png`
+    // into the sandbox temp dir).
+    let out_name = out.file_name().unwrap_or(out.as_os_str()).to_string_lossy();
+    let fmt = out
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_uppercase())
+        .unwrap_or_else(|| "PNG".to_string());
+    s.push_str(&format!(
+        "Output target: the final deliverable is `{out_name}`, a {fmt} image. Compose for this exact format and aspect.\n"
+    ));
     if let Some((w, h)) = size {
         s.push_str(&format!("Requested canvas: {w}x{h}.\n"));
     }
@@ -2823,9 +2838,26 @@ mod tests {
 
     #[test]
     fn image_instruction_always_includes_imagegen_keyword() {
-        let plain = image_instruction("scene", "a cat", None, None, false, "#00FF00");
+        let plain = image_instruction(
+            "scene",
+            "a cat",
+            None,
+            None,
+            false,
+            "#00FF00",
+            Path::new("hero/cat.png"),
+        );
         assert!(plain.contains("$imagegen"), "plain: {plain}");
-        let green = image_instruction("button", "a coin", None, None, true, "#00FF00");
+        assert!(plain.contains("cat.png"), "plain out target: {plain}");
+        let green = image_instruction(
+            "button",
+            "a coin",
+            None,
+            None,
+            true,
+            "#00FF00",
+            Path::new("ui/coin.png"),
+        );
         assert!(green.contains("$imagegen"), "green: {green}");
     }
 
