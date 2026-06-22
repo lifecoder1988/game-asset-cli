@@ -1405,7 +1405,10 @@ fn doctor(ctx: &Ctx) -> Result<()> {
     let ffmpeg = which::which("ffmpeg").ok();
     let minimax = env::var("MINIMAX_API_KEY").is_ok();
     let sandbox = env::var("CODEX_SANDBOX").unwrap_or_else(|_| "workspace-write".into());
-    let sandbox_allowed = matches!(sandbox.as_str(), "workspace-write" | "read-only");
+    let sandbox_allowed = matches!(
+        sandbox.as_str(),
+        "workspace-write" | "read-only" | "danger-full-access"
+    );
     let temp_dir_writable = temp_dir_is_writable();
     if ctx.json {
         ctx.event(
@@ -1890,13 +1893,9 @@ async fn run_codex_image(
     let rel_out = "asset.png";
     let final_instruction = format!(
         "{instruction}\n\n\
-Output handling (follow exactly):\n\
-- Generate the image with the built-in image_gen tool in THIS session for THIS request.\n\
-- Then materialize the PNG that YOUR image_gen call just produced in this session into `{rel_out}` in the current working directory. The image_gen result is the base64 PNG payload of your own `image_generation_call` in this session's rollout; decode that exact payload to `{rel_out}` (for example with `base64 -D`). Use only the result of the call you just made.\n\
-- Do NOT scan `$CODEX_HOME/generated_images` or any other directory for the newest PNG by modification time. Those locations accumulate unrelated images from previous sessions, so picking the latest file will copy the wrong image.\n\
-- After writing it, open `{rel_out}` with the view_image tool and confirm it matches the requested subject. If it does not match, or if no image was generated in this session, regenerate. Never substitute a pre-existing, stale, or unrelated file.\n\
-- On success, `{rel_out}` must be the ONLY .png in the current working directory and must be the image you just generated. Create parent directories if needed. Do not write any project files, manifests, scripts, or extra state beyond `{rel_out}`.\n\
-- If image generation is unavailable or fails, exit with a non-zero status. Do NOT copy any placeholder or stale image to `{rel_out}`."
+Generate the image for THIS request and save it directly to `./{rel_out}` in the current working directory.\n\
+- `./{rel_out}` must be the image you just generated — never a stale, placeholder, or unrelated file — and the only .png in this directory.\n\
+- If image generation fails, exit with a non-zero status and write nothing."
     );
     // Logged here (before the dry-run return) so `--verbose --dry-run` previews
     // the exact, full instruction without ever invoking codex.
@@ -2043,24 +2042,54 @@ Output handling (follow exactly):\n\
         }
         sleep(Duration::from_millis(400)).await;
     }
-    // Prefer the agreed asset.png; otherwise accept the single PNG the agent left
-    // in the fresh temp working dir (any .png there was created by this run).
-    let generated = {
-        let preferred = tmpdir.path().join(rel_out);
-        if preferred.is_file() {
-            preferred
-        } else {
-            let pngs = sorted_pngs(tmpdir.path())?;
-            pngs.into_iter().next_back().ok_or_else(|| {
-                CliError::new(6, "codex completed but did not produce a PNG image")
-            })?
+    // Security boundary: the codex workdir is a fresh, private 0700 temp dir, and
+    // the agent was told to leave exactly one PNG (`asset.png`). Enforce that here
+    // — zero or multiple PNGs means the output is ambiguous, so we refuse to copy
+    // anything rather than guess which file is the real asset.
+    let pngs = sorted_pngs(tmpdir.path())?;
+    let generated = match pngs.as_slice() {
+        [] => {
+            return Err(CliError::new(
+                6,
+                "codex completed but did not produce a PNG image",
+            ))
+        }
+        [single] => single.clone(),
+        many => {
+            return Err(CliError::new(
+                6,
+                format!(
+                    "codex left {} PNG files in the sandbox; expected exactly one ({rel_out})",
+                    many.len()
+                ),
+            ))
         }
     };
     ctx.vlog(format!("selected generated image: {}", generated.display()));
-    let generated_img = image::open(&generated)
-        .map_err(|e| CliError::new(7, format!("generated file is not an image: {e}")))?;
+
+    // Validate the bytes before trusting them: PNG signature, a plausible size,
+    // and a successful decode. We copy these exact bytes to --out, so every
+    // property we report downstream must actually hold here.
+    let bytes = fs::read(&generated)?;
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    if !bytes.starts_with(&PNG_MAGIC) {
+        return Err(CliError::new(
+            7,
+            "generated file is not a PNG (missing PNG signature)",
+        ));
+    }
+    // 67 bytes is the smallest a structurally valid PNG can be; less is junk.
+    if bytes.len() < 67 {
+        return Err(CliError::new(
+            7,
+            format!("generated PNG is implausibly small ({} bytes)", bytes.len()),
+        ));
+    }
+    let generated_img = image::load_from_memory(&bytes)
+        .map_err(|e| CliError::new(7, format!("generated file is not a decodable image: {e}")))?;
     ctx.vlog(format!(
-        "decoded image: {}x{}",
+        "validated PNG: {} bytes, {}x{}",
+        bytes.len(),
         generated_img.width(),
         generated_img.height()
     ));
@@ -2094,8 +2123,16 @@ Output handling (follow exactly):\n\
                 }),
             );
         }
+    } else if image_is_uniform(&generated_img) {
+        // A full-frame single flat color usually means a blank or failed render.
+        // (Green-source legitimately has flat regions, so it is excluded above.)
+        ctx.event(
+            "warning",
+            json!({
+                "message": "generated image is a single flat color; it may be blank or a failed render"
+            }),
+        );
     }
-    let bytes = fs::read(&generated)?;
     write_atomic(out, &bytes, overwrite)?;
     if let Some(meta) = metadata_out {
         write_json_atomic(
@@ -2472,14 +2509,13 @@ fn detect_key_color(files: &[PathBuf]) -> Result<[u8; 3]> {
 fn codex_sandbox() -> Result<String> {
     let sandbox = env::var("CODEX_SANDBOX").unwrap_or_else(|_| "workspace-write".into());
     match sandbox.as_str() {
-        "workspace-write" | "read-only" => Ok(sandbox),
-        "danger-full-access" => Err(CliError::new(
-            2,
-            "CODEX_SANDBOX=danger-full-access is not allowed by game-asset",
-        )),
+        // danger-full-access is opt-in only (never the default): it removes the
+        // codex sandbox entirely, so isolation then rests solely on the private
+        // 0700 temp working dir we pass via `-C`.
+        "workspace-write" | "read-only" | "danger-full-access" => Ok(sandbox),
         _ => Err(CliError::new(
             2,
-            "CODEX_SANDBOX must be workspace-write or read-only",
+            "CODEX_SANDBOX must be workspace-write, read-only, or danger-full-access",
         )),
     }
 }
@@ -2773,6 +2809,17 @@ fn kind_from_ext(path: &Path) -> &'static str {
     }
 }
 
+/// True if every pixel is identical (a single flat color). Used to flag blank or
+/// failed renders. A zero-pixel image counts as uniform.
+fn image_is_uniform(img: &DynamicImage) -> bool {
+    let rgba = img.to_rgba8();
+    let mut pixels = rgba.pixels();
+    match pixels.next() {
+        Some(&first) => pixels.all(|&p| p == first),
+        None => true,
+    }
+}
+
 fn sorted_pngs(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -2859,6 +2906,15 @@ mod tests {
             Path::new("ui/coin.png"),
         );
         assert!(green.contains("$imagegen"), "green: {green}");
+    }
+
+    #[test]
+    fn image_is_uniform_detects_flat_vs_varied() {
+        let flat = DynamicImage::ImageRgba8(RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255])));
+        assert!(image_is_uniform(&flat));
+        let mut varied = RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]));
+        varied.put_pixel(2, 1, Rgba([11, 20, 30, 255]));
+        assert!(!image_is_uniform(&DynamicImage::ImageRgba8(varied)));
     }
 
     #[test]

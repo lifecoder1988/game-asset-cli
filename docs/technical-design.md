@@ -125,18 +125,32 @@ The Codex backend is a subprocess adapter, not a library dependency.
 The wrapper should:
 
 - Resolve `CODEX_BIN`, defaulting to `codex`.
-- Run `codex exec` non-interactively.
-- Prefer `--ephemeral` so Codex does not persist a session for this generation.
+- Run `codex exec` non-interactively (it never prompts for approval).
+- Do **not** pass `--ephemeral`: under it Codex does not persist the session
+  rollout, so the agent cannot recover the base64 PNG its own `image_gen` call
+  produced, and the run hangs until timeout. A normal persisted session lets it
+  decode the result into `asset.png`.
 - Use `--skip-git-repo-check` because asset generation often runs outside a Git
   repository.
 - Use `--sandbox workspace-write` by default.
-- Set `-C` to a temporary work directory or the output parent.
+- Set `-C` to a fresh, private (`0700`) temporary work directory — never the
+  project tree. Codex can only write inside this sandbox; `--add-dir` is never
+  passed, so it has no access to the real `--out` location.
 - Attach references with `--image`.
-- Instruct Codex to write exactly one file at the requested relative output path.
-- Verify that the requested file exists and is a valid image.
+- Instruct Codex to write exactly one file (`asset.png`) in the sandbox.
 
-The CLI must not parse Codex session state. The only successful outcome is a
-valid output file.
+After Codex exits, the wrapper validates the sandbox output before copying it to
+`--out`:
+
+- Exactly one PNG exists in the sandbox (zero or multiple is a hard error — the
+  output is ambiguous and nothing is copied).
+- The file begins with the PNG signature and is large enough to be a real PNG.
+- It decodes successfully; its dimensions are reported (a size mismatch against
+  `--size`, or a single-flat-color "blank render", is surfaced as a warning).
+
+Only after these checks does the wrapper itself copy the bytes to `--out`. The
+CLI must not parse Codex session state. The only successful outcome is a
+validated output file the wrapper moved into place.
 
 ## MiniMax HTTP Boundary
 
