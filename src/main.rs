@@ -1944,6 +1944,27 @@ Generate the image for THIS request now with your image generation tool, then sa
             }
         ));
         ctx.vlog(format!("timeout: {timeout_seconds}s"));
+        // The exact codex invocation. The instruction arg is shown as a
+        // placeholder because its full text is already printed above.
+        let mut argv = vec![
+            shell_quote(&codex_path.to_string_lossy()),
+            "exec".into(),
+            "--skip-git-repo-check".into(),
+            "--sandbox".into(),
+            shell_quote(&sandbox),
+            "-C".into(),
+            shell_quote(&tmpdir.path().to_string_lossy()),
+        ];
+        if let Some(m) = model {
+            argv.push("--model".into());
+            argv.push(shell_quote(m));
+        }
+        argv.push("'<instruction shown above>'".into());
+        for r in &canonical_refs {
+            argv.push("--image".into());
+            argv.push(shell_quote(&r.to_string_lossy()));
+        }
+        ctx.vlog(format!("codex command: {}", argv.join(" ")));
     }
     let mut cmd = TokioCommand::new(codex_path);
     // NOTE: do not pass --ephemeral. Under --ephemeral codex does not persist the
@@ -1977,18 +1998,14 @@ Generate the image for THIS request now with your image generation tool, then sa
     // Instead: as soon as a fresh PNG is on disk with a stable size, stop codex
     // and use what it produced.
     //
-    // stdout is sent to /dev/null (codex streams verbose agent logs there; if we
-    // piped it without draining, the pipe buffer would fill and deadlock codex
-    // before it ever wrote the image). Under --verbose we instead `inherit` it so
-    // the agent log streams straight to the terminal — inherit shares our own fd,
-    // so there is no pipe we own to overflow. stderr is piped and drained
-    // concurrently so the last line is still available for error reporting; under
-    // --verbose the drained buffer is also echoed to our stderr.
-    let stdout_target = if ctx.verbose {
-        Stdio::inherit()
-    } else {
-        Stdio::null()
-    };
+    // Both codex streams are piped and drained continuously by their own tasks.
+    // Draining is what prevents a deadlock: if a pipe filled without anyone
+    // reading, codex would block before ever writing the image. Under --verbose we
+    // echo each line straight to OUR stderr as it arrives, so the agent log streams
+    // live regardless of whether stdout is a TTY (codex hides its pretty log when
+    // stdout is not a terminal) and survives the timeout path. Echoing to stderr
+    // (never stdout) keeps the --json contract on stdout uncorrupted. stderr is
+    // additionally accumulated so its tail is available for error reporting.
     // Capture the launch instant and codex's image dir before spawning. codex
     // writes the PNG into `$CODEX_HOME/generated_images`; that dir accumulates
     // images across sessions, so we only ever trust files modified at/after
@@ -2005,22 +2022,36 @@ Generate the image for THIS request now with your image generation tool, then sa
         images_dir.display()
     ));
     let mut child = cmd
-        .stdout(stdout_target)
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| CliError::new(6, format!("run codex: {e}")))?;
-    let stderr_tail = std::sync::Arc::new(Mutex::new(String::new()));
-    if let Some(mut err) = child.stderr.take() {
-        let sink = stderr_tail.clone();
-        let echo = ctx.verbose;
+    let verbose = ctx.verbose;
+    if let Some(out) = child.stdout.take() {
         tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf = String::new();
-            let _ = err.read_to_string(&mut buf).await;
-            if echo && !buf.is_empty() {
-                eprint!("{buf}");
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(out).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if verbose {
+                    eprintln!("{line}");
+                }
             }
-            *sink.lock().unwrap() = buf;
+        });
+    }
+    let stderr_tail = std::sync::Arc::new(Mutex::new(String::new()));
+    if let Some(err) = child.stderr.take() {
+        let sink = stderr_tail.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if verbose {
+                    eprintln!("{line}");
+                }
+                let mut buf = sink.lock().unwrap();
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         });
     }
     // The freshly-generated PNG is the newest file in `generated_images` whose
@@ -2526,6 +2557,19 @@ fn detect_key_color(files: &[PathBuf]) -> Result<[u8; 3]> {
         }
     }
     Ok([best[0], best[1], best[2]])
+}
+
+/// Minimal POSIX shell quoting for displaying a command line. Bare if the token
+/// is a simple word; single-quoted (with embedded quotes escaped) otherwise.
+fn shell_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./=:,@%+".contains(&b));
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 fn codex_sandbox() -> Result<String> {
