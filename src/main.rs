@@ -2115,7 +2115,10 @@ If image generation fails, exit with a non-zero status."
     let generated = newest_generated_png(&images_dir, run_start)?.ok_or_else(|| {
         CliError::new(
             6,
-            "codex did not generate an image in generated_images; try CODEX_REASONING_EFFORT=high",
+            "codex wrote no image to generated_images. If the codex log says it \
+             \"Generated\" an image, its built-in image backend is likely \
+             unauthorized — re-run `codex login` and confirm the account has image \
+             generation (watch the -v log for auth fail / 403).",
         )
     })?;
     ctx.vlog(format!("selected generated image: {}", generated.display()));
