@@ -1889,12 +1889,14 @@ async fn run_codex_image(
         );
     }
     // Just have codex generate; we locate the result ourselves by scanning
-    // generated_images for the file that appears after launch. No --output-schema:
-    // forcing a structured answer tempts the model to fabricate a path and skip
-    // the image tool entirely.
+    // generated_images for the file that appears after launch. No --output-schema
+    // (it tempts the model to fabricate a path and skip the tool). We also do NOT
+    // forbid skills: `$imagegen` is handled by codex's own `imagegen` system skill
+    // (the built-in image_gen path that saves into generated_images), so a blanket
+    // "no third-party skill" rule makes codex avoid the working path.
     let final_instruction = format!(
         "{instruction}\n\n\
-Generate the image for THIS request now using your built-in image generation tool (triggered by the $imagegen keyword above). Do NOT use any MCP server, MCP tool, or third-party skill.\n\
+Generate the image for THIS request now using your built-in image generation tool (the $imagegen keyword above triggers codex's imagegen skill / built-in image_gen path).\n\
 If image generation fails, exit with a non-zero status."
     );
     // Logged here (before the dry-run return) so `--verbose --dry-run` previews

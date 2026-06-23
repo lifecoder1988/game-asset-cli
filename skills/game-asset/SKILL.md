@@ -74,9 +74,11 @@ Notes:
   with effort `none` the model fabricates a fake image path instead of actually
   generating. Leave it at `high` unless you have a reason to lower it.
 - **`CODEX_BIN`** — optional path to the Codex executable (default: `codex`).
-- Codex must be authenticated (`codex login`). The model must not be routed
-  through a broken MCP server — the tool already instructs Codex to use only its
-  built-in image tool and to avoid any MCP server/tool or third-party skill.
+- Codex must be authenticated (`codex login`) **and have working image
+  generation** — `$imagegen` is handled by codex's `imagegen` system skill, whose
+  built-in `image_gen` path saves into `~/.codex/generated_images/`. If that
+  backend is unauthorized, codex narrates success but writes no file and the run
+  times out; fix codex's auth/image access (see Troubleshooting).
 
 ### Green-screen asset (for clean cutouts)
 
@@ -268,15 +270,20 @@ shadow, no scene, no text, no watermark.
 
 ## Troubleshooting image generation
 
-- **Hangs then times out / "did not generate an image"** — usually a Codex-side
-  problem. Re-run with `-v` and read the streamed Codex log.
-- **"reported <path> but it does not exist; try CODEX_REASONING_EFFORT=high"** —
-  Codex fabricated a path without generating. Ensure the banner shows
-  `reasoning effort: high` (the tool forces this; don't override it lower).
-- **Auth errors in the Codex log** (`auth fail:token fail`, `AuthorizationRequired`,
-  HTTP 401/403) — Codex or one of its MCP servers needs re-auth. Run
-  `codex login`; disable/refresh any failing MCP server.
+- **"codex did not generate an image in generated_images" / time out** — usually
+  a Codex-side problem, not the CLI. Re-run with `-v` and read the streamed log.
+- **Codex narrates success ("Generated …") but no file appears** — codex's
+  built-in `image_gen` backend is unauthorized/broken: the model reports success
+  while writing nothing. Confirm by running bare codex and searching for a fresh
+  PNG (`find ~ /tmp -name '*.png' -mmin -5`). Fix codex's image-gen access:
+  re-`codex login`; check the account/plan has image generation; watch for
+  `auth fail:token fail` / `AuthorizationRequired` / HTTP 403 in the `-v` log.
+  As a backend-independent fallback, the `imagegen` system skill can run
+  `~/.codex/skills/.system/imagegen/scripts/image_gen.py` with `OPENAI_API_KEY`.
+- **`reasoning effort: none` in the banner** — the tool forces
+  `model_reasoning_effort=high`; don't override it lower (low effort makes the
+  model fabricate instead of generating).
 - **Sandbox blocks the write** — try `CODEX_SANDBOX=danger-full-access`.
-- Use `-v` to see: the full instruction, the exact `codex exec …` command, the
-  live Codex log, and `codex reported image_path: …`. Use `--dry-run -v` to
+- Use `-v` to see the full instruction, the exact `codex exec …` command, the
+  live Codex log, and `selected generated image: …`. Use `--dry-run -v` to
   preview the prompt without spending a generation.
