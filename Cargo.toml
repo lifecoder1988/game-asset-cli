@@ -1,6 +1,6 @@
 [package]
 name = "game-asset-cli"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 license = "MIT"
 description = "Stateless CLI for generating and post-processing game assets"

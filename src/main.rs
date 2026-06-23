@@ -1890,16 +1890,16 @@ async fn run_codex_image(
             fs::canonicalize(r).map_err(|e| CliError::new(3, format!("{}: {e}", r.display())))?,
         );
     }
-    // We pick the result up from `$CODEX_HOME/generated_images` (codex always
-    // writes there), so the save path below is not how we find the file — but an
-    // explicit "generate and save to a file" directive is load-bearing for
-    // reliably triggering codex's image tool. Without it, codex often treats the
-    // framed brief as a broader agentic task and never generates at all.
-    let rel_out = "asset.png";
+    // Ask codex to generate with its built-in image tool and report the path it
+    // wrote. `--output-schema` (set below) constrains the final message to
+    // {"image_path": "..."}, so this is a one-shot structured result: we read the
+    // path codex reports rather than guessing which file in generated_images is
+    // ours. (We still keep the generated_images mtime scan as a fallback.)
     let final_instruction = format!(
         "{instruction}\n\n\
-Generate the image for THIS request now with your image generation tool, then save it to `./{rel_out}` in the current working directory.\n\
-- If image generation fails, exit with a non-zero status."
+Generate the image for THIS request now using your built-in image generation tool (triggered by the $imagegen keyword above). Do NOT use any MCP server or tool to generate the image.\n\
+Your final message must report the absolute filesystem path of the PNG file you generated.\n\
+If image generation fails, exit with a non-zero status."
     );
     // Logged here (before the dry-run return) so `--verbose --dry-run` previews
     // the exact instruction without ever invoking codex.
@@ -1926,6 +1926,25 @@ Generate the image for THIS request now with your image generation tool, then sa
         .ok_or_else(|| CliError::new(5, format!("{codex_bin} not found or not executable")))?;
     let sandbox = codex_sandbox()?;
     let tmpdir = TempDir::new().map_err(|e| CliError::new(1, e.to_string()))?;
+    // One-shot structured output: codex constrains its final message to this
+    // schema and writes it to `msg_path`; we read the reported path from there.
+    let schema_path = tmpdir.path().join("output-schema.json");
+    let msg_path = tmpdir.path().join("last-message.json");
+    fs::write(
+        &schema_path,
+        br#"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "image_path": {
+      "type": "string",
+      "description": "Absolute filesystem path to the generated PNG file."
+    }
+  },
+  "required": ["image_path"]
+}
+"#,
+    )?;
     if ctx.verbose {
         ctx.vlog(format!("codex binary: {}", codex_path.display()));
         ctx.vlog(format!("sandbox: {sandbox}"));
@@ -1954,6 +1973,10 @@ Generate the image for THIS request now with your image generation tool, then sa
             shell_quote(&sandbox),
             "-C".into(),
             shell_quote(&tmpdir.path().to_string_lossy()),
+            "--output-schema".into(),
+            shell_quote(&schema_path.to_string_lossy()),
+            "-o".into(),
+            shell_quote(&msg_path.to_string_lossy()),
         ];
         if let Some(m) = model {
             argv.push("--model".into());
@@ -1976,7 +1999,11 @@ Generate the image for THIS request now with your image generation tool, then sa
         .arg("--sandbox")
         .arg(&sandbox)
         .arg("-C")
-        .arg(tmpdir.path());
+        .arg(tmpdir.path())
+        .arg("--output-schema")
+        .arg(&schema_path)
+        .arg("-o")
+        .arg(&msg_path);
     cmd.kill_on_drop(true);
     if let Some(model) = model {
         cmd.arg("--model").arg(model);
@@ -1991,12 +2018,11 @@ Generate the image for THIS request now with your image generation tool, then sa
     }
     ctx.event("provider_request", request_event);
 
-    // Drive codex by polling `generated_images` for the new file instead of
-    // blocking on full process exit. After writing the image codex may run extra
-    // confirmation steps that extend its lifetime past the timeout; waiting on
-    // exit would kill and discard a perfectly good, already-written image.
-    // Instead: as soon as a fresh PNG is on disk with a stable size, stop codex
-    // and use what it produced.
+    // Drive codex by polling for its final-message file (`msg_path`) instead of
+    // blocking on full process exit. codex writes that file when its turn
+    // completes (image already generated); it may then linger on background work
+    // past the timeout, so waiting on exit would discard a perfectly good result.
+    // Instead: as soon as the message file is present and size-stable, stop codex.
     //
     // Both codex streams are piped and drained continuously by their own tasks.
     // Draining is what prevents a deadlock: if a pipe filled without anyone
@@ -2054,42 +2080,42 @@ Generate the image for THIS request now with your image generation tool, then sa
             }
         });
     }
-    // The freshly-generated PNG is the newest file in `generated_images` whose
-    // mtime is at/after launch.
-    let find = || newest_generated_png(&images_dir, run_start);
+    // Length of codex's final-message file once it is non-empty.
+    let msg_len = || {
+        fs::metadata(&msg_path)
+            .ok()
+            .map(|m| m.len())
+            .filter(|&n| n > 0)
+    };
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
-    let mut last: Option<(PathBuf, u64)> = None;
+    let mut last_len: Option<u64> = None;
     loop {
         if let Some(status) = child
             .try_wait()
             .map_err(|e| CliError::new(6, format!("wait codex: {e}")))?
         {
-            // Codex exited on its own. A nonzero status is only fatal if no image
-            // was written — codex may exit nonzero after a successful write.
-            if !status.success() && find()?.is_none() {
+            // Codex exited on its own. Fatal only if it left neither a final
+            // message nor a fresh image (it may exit nonzero after a good write).
+            if !status.success()
+                && msg_len().is_none()
+                && newest_generated_png(&images_dir, run_start)?.is_none()
+            {
                 let tail = stderr_tail.lock().unwrap().clone();
                 let tail = tail.lines().last().unwrap_or("no stderr").to_string();
                 return Err(CliError::new(6, format!("codex failed: {tail}")));
             }
             break;
         }
-        // A candidate PNG present and size-steady across two consecutive polls =>
-        // the write has completed; terminate codex early.
-        if let Some(candidate) = find()? {
-            match fs::metadata(&candidate).map(|m| m.len()) {
-                Ok(size)
-                    if size > 0
-                        && last.as_ref().map(|(p, s)| (p, *s)) == Some((&candidate, size)) =>
-                {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    break;
-                }
-                Ok(size) if size > 0 => last = Some((candidate, size)),
-                _ => last = None,
+        // Final message written and size-steady across two polls => turn done;
+        // terminate codex early rather than waiting out any lingering work.
+        match msg_len() {
+            Some(len) if last_len == Some(len) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                break;
             }
-        } else {
-            last = None;
+            Some(len) => last_len = Some(len),
+            None => last_len = None,
         }
         if Instant::now() >= deadline {
             let _ = child.start_kill();
@@ -2101,14 +2127,20 @@ Generate the image for THIS request now with your image generation tool, then sa
         }
         sleep(Duration::from_millis(400)).await;
     }
-    // The image this run produced: the newest PNG in `generated_images` modified
-    // at/after launch. The validation below still gates what we copy out.
-    let generated = newest_generated_png(&images_dir, run_start)?.ok_or_else(|| {
-        CliError::new(
-            6,
-            "codex completed but did not produce an image in generated_images",
-        )
-    })?;
+    // Prefer the path codex reported in its final JSON message; fall back to the
+    // newest fresh PNG in generated_images if the message is missing/unparseable.
+    let reported = fs::read_to_string(&msg_path)
+        .ok()
+        .and_then(|m| parse_image_path_from_message(&m));
+    if let Some(p) = &reported {
+        ctx.vlog(format!("codex reported image_path: {}", p.display()));
+    }
+    let generated = match reported {
+        Some(p) if p.is_file() => p,
+        _ => newest_generated_png(&images_dir, run_start)?.ok_or_else(|| {
+            CliError::new(6, "codex completed but did not report or produce an image")
+        })?,
+    };
     ctx.vlog(format!("selected generated image: {}", generated.display()));
 
     // Validate the bytes before trusting them: PNG signature, a plausible size,
@@ -2557,6 +2589,20 @@ fn detect_key_color(files: &[PathBuf]) -> Result<[u8; 3]> {
         }
     }
     Ok([best[0], best[1], best[2]])
+}
+
+/// Extract `image_path` from codex's final message. With `--output-schema` the
+/// message is JSON, but we parse leniently — locate the outermost `{...}` and
+/// read `image_path` — so a stray prose wrapper does not break it.
+fn parse_image_path_from_message(msg: &str) -> Option<PathBuf> {
+    let start = msg.find('{')?;
+    let end = msg.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    let value: Value = serde_json::from_str(&msg[start..=end]).ok()?;
+    let path = value.get("image_path")?.as_str()?.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 /// Minimal POSIX shell quoting for displaying a command line. Bare if the token
@@ -3009,6 +3055,23 @@ fn green_kind_name(kind: &GreenKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_image_path_handles_json_and_prose_wrapped_json() {
+        assert_eq!(
+            parse_image_path_from_message(r#"{"image_path": "/a/b/c.png"}"#),
+            Some(PathBuf::from("/a/b/c.png"))
+        );
+        // Tolerate a prose wrapper around the JSON.
+        assert_eq!(
+            parse_image_path_from_message("Done!\n{\"image_path\":\"/x/y.png\"}\nthanks"),
+            Some(PathBuf::from("/x/y.png"))
+        );
+        // Empty path or missing key => None.
+        assert_eq!(parse_image_path_from_message(r#"{"image_path": ""}"#), None);
+        assert_eq!(parse_image_path_from_message(r#"{"other": "z"}"#), None);
+        assert_eq!(parse_image_path_from_message("no json here"), None);
+    }
 
     #[test]
     fn newest_generated_png_ignores_stale_and_picks_fresh() {
