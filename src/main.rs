@@ -1895,9 +1895,9 @@ async fn run_codex_image(
     // ours. (We still keep the generated_images mtime scan as a fallback.)
     let final_instruction = format!(
         "{instruction}\n\n\
-Generate the image for THIS request now using your built-in image generation tool (triggered by the $imagegen keyword above). Do NOT use any MCP server, MCP tool, or third-party skill to generate the image.\n\
-Your final message must report the absolute filesystem path of the PNG file you generated.\n\
-If image generation fails, exit with a non-zero status."
+STEP 1 (required first): actually generate the image for THIS request by calling your built-in image generation tool now (triggered by the $imagegen keyword above). Do NOT use any MCP server, MCP tool, or third-party skill.\n\
+STEP 2 (only after the PNG exists on disk): set `image_path` to the real absolute path of the file you just generated.\n\
+Never invent, guess, or reuse a path. If you have not actually generated a new image this turn, you have failed: exit with a non-zero status instead of reporting any path."
     );
     // Logged here (before the dry-run return) so `--verbose --dry-run` previews
     // the exact instruction without ever invoking codex.
@@ -1928,12 +1928,29 @@ If image generation fails, exit with a non-zero status."
     // running its image tool, so generation silently never happens.
     let reasoning = codex_reasoning_effort();
     let tmpdir = TempDir::new().map_err(|e| CliError::new(1, e.to_string()))?;
-    // Capture codex's final message (it should report the image path) via `-o`.
-    // We deliberately do NOT pass `--output-schema`: forcing a structured final
-    // answer makes the model satisfy the schema with a fabricated path and skip
-    // the image-tool call entirely. The real source of truth is the file that
-    // actually appears in generated_images; the reported path is a hint.
+    // One-shot structured output: `--output-schema` constrains codex's final
+    // message to {"image_path": "..."}, captured via `-o`. NOTE: structured output
+    // can tempt the model to fill the schema with a fabricated path and skip the
+    // image-tool call, so the instruction forces generation first, and the file
+    // that actually appears in generated_images remains the source of truth (the
+    // reported path is only used when it exists on disk).
+    let schema_path = tmpdir.path().join("output-schema.json");
     let msg_path = tmpdir.path().join("last-message.json");
+    fs::write(
+        &schema_path,
+        br#"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "image_path": {
+      "type": "string",
+      "description": "Absolute filesystem path to the generated PNG file."
+    }
+  },
+  "required": ["image_path"]
+}
+"#,
+    )?;
     if ctx.verbose {
         ctx.vlog(format!("codex binary: {}", codex_path.display()));
         ctx.vlog(format!("sandbox: {sandbox}"));
@@ -1964,6 +1981,8 @@ If image generation fails, exit with a non-zero status."
             shell_quote(&tmpdir.path().to_string_lossy()),
             "-c".into(),
             shell_quote(&format!("model_reasoning_effort={reasoning}")),
+            "--output-schema".into(),
+            shell_quote(&schema_path.to_string_lossy()),
             "-o".into(),
             shell_quote(&msg_path.to_string_lossy()),
         ];
@@ -1991,6 +2010,8 @@ If image generation fails, exit with a non-zero status."
         .arg(tmpdir.path())
         .arg("-c")
         .arg(format!("model_reasoning_effort={reasoning}"))
+        .arg("--output-schema")
+        .arg(&schema_path)
         .arg("-o")
         .arg(&msg_path);
     cmd.kill_on_drop(true);
