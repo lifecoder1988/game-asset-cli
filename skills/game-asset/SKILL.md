@@ -75,8 +75,8 @@ Notes:
   generating. Leave it at `high` unless you have a reason to lower it.
 - **`CODEX_BIN`** — optional path to the Codex executable (default: `codex`).
 - Codex must be authenticated (`codex login`). The model must not be routed
-  through a broken MCP server — the tool already instructs Codex to use its
-  built-in image tool and avoid MCP.
+  through a broken MCP server — the tool already instructs Codex to use only its
+  built-in image tool and to avoid any MCP server/tool or third-party skill.
 
 ### Green-screen asset (for clean cutouts)
 

@@ -1895,7 +1895,7 @@ async fn run_codex_image(
     // ours. (We still keep the generated_images mtime scan as a fallback.)
     let final_instruction = format!(
         "{instruction}\n\n\
-Generate the image for THIS request now using your built-in image generation tool (triggered by the $imagegen keyword above). Do NOT use any MCP server or tool to generate the image.\n\
+Generate the image for THIS request now using your built-in image generation tool (triggered by the $imagegen keyword above). Do NOT use any MCP server, MCP tool, or third-party skill to generate the image.\n\
 Your final message must report the absolute filesystem path of the PNG file you generated.\n\
 If image generation fails, exit with a non-zero status."
     );
