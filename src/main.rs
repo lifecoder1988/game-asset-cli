@@ -1923,6 +1923,10 @@ If image generation fails, exit with a non-zero status."
     let codex_path = resolve_executable(&codex_bin)
         .ok_or_else(|| CliError::new(5, format!("{codex_bin} not found or not executable")))?;
     let sandbox = codex_sandbox()?;
+    // Force a reasoning effort: with effort "none" the model shortcuts and emits
+    // a schema-satisfying JSON with a fabricated image_path instead of actually
+    // running its image tool, so generation silently never happens.
+    let reasoning = codex_reasoning_effort();
     let tmpdir = TempDir::new().map_err(|e| CliError::new(1, e.to_string()))?;
     // One-shot structured output: codex constrains its final message to this
     // schema and writes it to `msg_path`; we read the reported path from there.
@@ -1971,6 +1975,8 @@ If image generation fails, exit with a non-zero status."
             shell_quote(&sandbox),
             "-C".into(),
             shell_quote(&tmpdir.path().to_string_lossy()),
+            "-c".into(),
+            shell_quote(&format!("model_reasoning_effort={reasoning}")),
             "--output-schema".into(),
             shell_quote(&schema_path.to_string_lossy()),
             "-o".into(),
@@ -1998,6 +2004,8 @@ If image generation fails, exit with a non-zero status."
         .arg(&sandbox)
         .arg("-C")
         .arg(tmpdir.path())
+        .arg("-c")
+        .arg(format!("model_reasoning_effort={reasoning}"))
         .arg("--output-schema")
         .arg(&schema_path)
         .arg("-o")
@@ -2129,18 +2137,29 @@ If image generation fails, exit with a non-zero status."
         }
         sleep(Duration::from_millis(400)).await;
     }
-    // Prefer the path codex reported in its final JSON message; fall back to the
-    // newest fresh PNG in generated_images if the message is missing/unparseable.
+    // Prefer the path codex reported in its final JSON message, but only if it
+    // actually exists — the model often invents a plausible filename rather than
+    // imagegen's real auto-generated `<uuid>/ig_*.png`. Otherwise fall back to the
+    // newest PNG that appeared in generated_images after launch (the real file).
     let reported = fs::read_to_string(&msg_path)
         .ok()
         .and_then(|m| parse_image_path_from_message(&m));
     if let Some(p) = &reported {
         ctx.vlog(format!("codex reported image_path: {}", p.display()));
     }
-    let generated = match reported {
-        Some(p) if p.is_file() => p,
+    let generated = match &reported {
+        Some(p) if p.is_file() => p.clone(),
         _ => newest_generated_png(&images_dir, run_start)?.ok_or_else(|| {
-            CliError::new(6, "codex completed but did not report or produce an image")
+            // No real image on disk: codex likely fabricated a path without
+            // generating (often when reasoning effort is "none").
+            let hint = match &reported {
+                Some(p) => format!(" (reported {} but it does not exist)", p.display()),
+                None => String::new(),
+            };
+            CliError::new(
+                6,
+                format!("codex did not generate an image{hint}; try CODEX_REASONING_EFFORT=high"),
+            )
         })?,
     };
     ctx.vlog(format!("selected generated image: {}", generated.display()));
@@ -2605,6 +2624,16 @@ fn shell_quote(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
+}
+
+/// Reasoning effort forced on codex via `-c model_reasoning_effort=`. Defaults to
+/// `high` (codex configs that default to `none` cause the model to fabricate a
+/// result instead of generating). Override with `CODEX_REASONING_EFFORT`.
+fn codex_reasoning_effort() -> String {
+    env::var("CODEX_REASONING_EFFORT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "high".into())
 }
 
 fn codex_sandbox() -> Result<String> {
