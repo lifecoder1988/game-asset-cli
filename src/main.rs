@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Mutex,
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 use tempfile::TempDir;
 use tokio::{
@@ -1890,15 +1890,19 @@ async fn run_codex_image(
             fs::canonicalize(r).map_err(|e| CliError::new(3, format!("{}: {e}", r.display())))?,
         );
     }
+    // We pick the result up from `$CODEX_HOME/generated_images` (codex always
+    // writes there), so the save path below is not how we find the file — but an
+    // explicit "generate and save to a file" directive is load-bearing for
+    // reliably triggering codex's image tool. Without it, codex often treats the
+    // framed brief as a broader agentic task and never generates at all.
     let rel_out = "asset.png";
     let final_instruction = format!(
         "{instruction}\n\n\
-Generate the image for THIS request and save it directly to `./{rel_out}` in the current working directory.\n\
-- `./{rel_out}` must be the image you just generated — never a stale, placeholder, or unrelated file — and the only .png in this directory.\n\
-- If image generation fails, exit with a non-zero status and write nothing."
+Generate the image for THIS request now with your image generation tool, then save it to `./{rel_out}` in the current working directory.\n\
+- If image generation fails, exit with a non-zero status."
     );
     // Logged here (before the dry-run return) so `--verbose --dry-run` previews
-    // the exact, full instruction without ever invoking codex.
+    // the exact instruction without ever invoking codex.
     ctx.vlog(format!(
         "full provider instruction follows:\n{final_instruction}"
     ));
@@ -1943,9 +1947,9 @@ Generate the image for THIS request and save it directly to `./{rel_out}` in the
     }
     let mut cmd = TokioCommand::new(codex_path);
     // NOTE: do not pass --ephemeral. Under --ephemeral codex does not persist the
-    // session rollout, so the agent cannot recover the base64 PNG produced by its
-    // own image_gen call and the run hangs until timeout. A normal (persisted)
-    // session lets the agent decode its result into asset.png.
+    // session rollout, so the agent's image_gen call can fail to materialize and
+    // the run hangs until timeout. A normal (persisted) session generates the
+    // image reliably.
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("--sandbox")
@@ -1966,12 +1970,12 @@ Generate the image for THIS request and save it directly to `./{rel_out}` in the
     }
     ctx.event("provider_request", request_event);
 
-    // Drive codex by polling for the output file instead of blocking on full
-    // process exit. Codex writes asset.png, then runs a view_image confirmation
-    // step that can extend the process lifetime well past the timeout. Waiting on
-    // exit means a perfectly good (already-written) image gets killed and thrown
-    // away. Instead: as soon as asset.png is on disk with a stable size, stop
-    // codex and use what it produced.
+    // Drive codex by polling `generated_images` for the new file instead of
+    // blocking on full process exit. After writing the image codex may run extra
+    // confirmation steps that extend its lifetime past the timeout; waiting on
+    // exit would kill and discard a perfectly good, already-written image.
+    // Instead: as soon as a fresh PNG is on disk with a stable size, stop codex
+    // and use what it produced.
     //
     // stdout is sent to /dev/null (codex streams verbose agent logs there; if we
     // piped it without draining, the pipe buffer would fill and deadlock codex
@@ -1985,6 +1989,21 @@ Generate the image for THIS request and save it directly to `./{rel_out}` in the
     } else {
         Stdio::null()
     };
+    // Capture the launch instant and codex's image dir before spawning. codex
+    // writes the PNG into `$CODEX_HOME/generated_images`; that dir accumulates
+    // images across sessions, so we only ever trust files modified at/after
+    // `run_start` — those belong to this run.
+    let run_start = SystemTime::now();
+    let images_dir = codex_generated_images_dir().ok_or_else(|| {
+        CliError::new(
+            1,
+            "cannot locate codex generated_images dir (set CODEX_HOME or HOME)",
+        )
+    })?;
+    ctx.vlog(format!(
+        "watching codex image dir: {}",
+        images_dir.display()
+    ));
     let mut child = cmd
         .stdout(stdout_target)
         .stderr(Stdio::piped())
@@ -2004,9 +2023,11 @@ Generate the image for THIS request and save it directly to `./{rel_out}` in the
             *sink.lock().unwrap() = buf;
         });
     }
-    let asset = tmpdir.path().join(rel_out);
+    // The freshly-generated PNG is the newest file in `generated_images` whose
+    // mtime is at/after launch.
+    let find = || newest_generated_png(&images_dir, run_start);
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
-    let mut last_size: Option<u64> = None;
+    let mut last: Option<(PathBuf, u64)> = None;
     loop {
         if let Some(status) = child
             .try_wait()
@@ -2014,23 +2035,30 @@ Generate the image for THIS request and save it directly to `./{rel_out}` in the
         {
             // Codex exited on its own. A nonzero status is only fatal if no image
             // was written — codex may exit nonzero after a successful write.
-            if !status.success() && !asset.is_file() && sorted_pngs(tmpdir.path())?.is_empty() {
+            if !status.success() && find()?.is_none() {
                 let tail = stderr_tail.lock().unwrap().clone();
                 let tail = tail.lines().last().unwrap_or("no stderr").to_string();
                 return Err(CliError::new(6, format!("codex failed: {tail}")));
             }
             break;
         }
-        // asset.png present and size steady across two consecutive polls => the
-        // write has completed; terminate codex early.
-        match fs::metadata(&asset).map(|m| m.len()) {
-            Ok(size) if size > 0 && last_size == Some(size) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                break;
+        // A candidate PNG present and size-steady across two consecutive polls =>
+        // the write has completed; terminate codex early.
+        if let Some(candidate) = find()? {
+            match fs::metadata(&candidate).map(|m| m.len()) {
+                Ok(size)
+                    if size > 0
+                        && last.as_ref().map(|(p, s)| (p, *s)) == Some((&candidate, size)) =>
+                {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    break;
+                }
+                Ok(size) if size > 0 => last = Some((candidate, size)),
+                _ => last = None,
             }
-            Ok(size) if size > 0 => last_size = Some(size),
-            _ => last_size = None,
+        } else {
+            last = None;
         }
         if Instant::now() >= deadline {
             let _ = child.start_kill();
@@ -2042,29 +2070,14 @@ Generate the image for THIS request and save it directly to `./{rel_out}` in the
         }
         sleep(Duration::from_millis(400)).await;
     }
-    // Security boundary: the codex workdir is a fresh, private 0700 temp dir, and
-    // the agent was told to leave exactly one PNG (`asset.png`). Enforce that here
-    // — zero or multiple PNGs means the output is ambiguous, so we refuse to copy
-    // anything rather than guess which file is the real asset.
-    let pngs = sorted_pngs(tmpdir.path())?;
-    let generated = match pngs.as_slice() {
-        [] => {
-            return Err(CliError::new(
-                6,
-                "codex completed but did not produce a PNG image",
-            ))
-        }
-        [single] => single.clone(),
-        many => {
-            return Err(CliError::new(
-                6,
-                format!(
-                    "codex left {} PNG files in the sandbox; expected exactly one ({rel_out})",
-                    many.len()
-                ),
-            ))
-        }
-    };
+    // The image this run produced: the newest PNG in `generated_images` modified
+    // at/after launch. The validation below still gates what we copy out.
+    let generated = newest_generated_png(&images_dir, run_start)?.ok_or_else(|| {
+        CliError::new(
+            6,
+            "codex completed but did not produce an image in generated_images",
+        )
+    })?;
     ctx.vlog(format!("selected generated image: {}", generated.display()));
 
     // Validate the bytes before trusting them: PNG signature, a plausible size,
@@ -2134,6 +2147,15 @@ Generate the image for THIS request and save it directly to `./{rel_out}` in the
         );
     }
     write_atomic(out, &bytes, overwrite)?;
+    // We own this file (it is this run's output), so move rather than copy: remove
+    // it from the shared `generated_images` dir now that it is safely at --out.
+    // Best-effort — a leftover is harmless (future runs filter by mtime).
+    if let Err(e) = fs::remove_file(&generated) {
+        ctx.vlog(format!(
+            "could not remove source {}: {e}",
+            generated.display()
+        ));
+    }
     if let Some(meta) = metadata_out {
         write_json_atomic(
             meta,
@@ -2820,6 +2842,67 @@ fn image_is_uniform(img: &DynamicImage) -> bool {
     }
 }
 
+/// All `.png` files anywhere under `dir` (recursive). Used to locate the codex
+/// output even when it lands in a subdirectory of the sandbox workdir.
+fn find_pngs_recursive(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = match fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(path),
+                Ok(ft) if ft.is_file() => {
+                    let is_png = path
+                        .extension()
+                        .and_then(OsStr::to_str)
+                        .map(|e| e.eq_ignore_ascii_case("png"))
+                        .unwrap_or(false);
+                    if is_png {
+                        out.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// `$CODEX_HOME/generated_images` (or `$HOME/.codex/generated_images`). codex's
+/// imagegen always writes its PNG output here. Returns the path even if it does
+/// not exist yet (codex creates it on first use); None only when neither
+/// CODEX_HOME nor HOME is set.
+fn codex_generated_images_dir() -> Option<PathBuf> {
+    let home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))?;
+    Some(home.join("generated_images"))
+}
+
+/// The newest PNG in `dir` modified at/after `after`. The freshness filter is
+/// essential: `generated_images` accumulates images across sessions, so without
+/// it we could pick up an unrelated image from a previous run. None if no fresh
+/// PNG exists (or `dir` does not exist yet).
+fn newest_generated_png(dir: &Path, after: SystemTime) -> Result<Option<PathBuf>> {
+    let mut fresh: Vec<PathBuf> = find_pngs_recursive(dir)?
+        .into_iter()
+        .filter(|p| {
+            fs::metadata(p)
+                .and_then(|m| m.modified())
+                .map(|t| t >= after)
+                .unwrap_or(false)
+        })
+        .collect();
+    fresh.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
+    Ok(fresh.into_iter().next_back())
+}
+
 fn sorted_pngs(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -2882,6 +2965,28 @@ fn green_kind_name(kind: &GreenKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newest_generated_png_ignores_stale_and_picks_fresh() {
+        let dir = TempDir::new().unwrap();
+        // A stale image from a "previous session" must be ignored.
+        let stale = dir.path().join("old.png");
+        fs::write(&stale, b"old").unwrap();
+
+        let cutoff = SystemTime::now();
+        // Nothing fresh yet => None (the stale file predates the cutoff).
+        assert_eq!(newest_generated_png(dir.path(), cutoff).unwrap(), None);
+
+        // This run's image appears after the cutoff, even nested in a subdir.
+        let sub = dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let fresh = sub.join("new.png");
+        fs::write(&fresh, b"new").unwrap();
+        assert_eq!(
+            newest_generated_png(dir.path(), cutoff).unwrap(),
+            Some(fresh)
+        );
+    }
 
     #[test]
     fn image_instruction_always_includes_imagegen_keyword() {
