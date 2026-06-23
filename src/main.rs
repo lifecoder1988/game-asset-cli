@@ -1928,25 +1928,12 @@ If image generation fails, exit with a non-zero status."
     // running its image tool, so generation silently never happens.
     let reasoning = codex_reasoning_effort();
     let tmpdir = TempDir::new().map_err(|e| CliError::new(1, e.to_string()))?;
-    // One-shot structured output: codex constrains its final message to this
-    // schema and writes it to `msg_path`; we read the reported path from there.
-    let schema_path = tmpdir.path().join("output-schema.json");
+    // Capture codex's final message (it should report the image path) via `-o`.
+    // We deliberately do NOT pass `--output-schema`: forcing a structured final
+    // answer makes the model satisfy the schema with a fabricated path and skip
+    // the image-tool call entirely. The real source of truth is the file that
+    // actually appears in generated_images; the reported path is a hint.
     let msg_path = tmpdir.path().join("last-message.json");
-    fs::write(
-        &schema_path,
-        br#"{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "image_path": {
-      "type": "string",
-      "description": "Absolute filesystem path to the generated PNG file."
-    }
-  },
-  "required": ["image_path"]
-}
-"#,
-    )?;
     if ctx.verbose {
         ctx.vlog(format!("codex binary: {}", codex_path.display()));
         ctx.vlog(format!("sandbox: {sandbox}"));
@@ -1977,8 +1964,6 @@ If image generation fails, exit with a non-zero status."
             shell_quote(&tmpdir.path().to_string_lossy()),
             "-c".into(),
             shell_quote(&format!("model_reasoning_effort={reasoning}")),
-            "--output-schema".into(),
-            shell_quote(&schema_path.to_string_lossy()),
             "-o".into(),
             shell_quote(&msg_path.to_string_lossy()),
         ];
@@ -2006,8 +1991,6 @@ If image generation fails, exit with a non-zero status."
         .arg(tmpdir.path())
         .arg("-c")
         .arg(format!("model_reasoning_effort={reasoning}"))
-        .arg("--output-schema")
-        .arg(&schema_path)
         .arg("-o")
         .arg(&msg_path);
     cmd.kill_on_drop(true);
